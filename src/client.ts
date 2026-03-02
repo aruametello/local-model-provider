@@ -249,6 +249,9 @@ export class GatewayClient {
       finalizedIndices: new Set<number>(),
       requestId: `req_${Date.now()}_${randomBytes(4).toString('hex')}`,
       toolCallCounter: 0,
+      handleSSEError: (error: Error) => {
+        console.error('[LLM Gateway] SSE stream error:', error);
+      },
     };
   }
 
@@ -506,20 +509,39 @@ export class GatewayClient {
         throw new GatewayError('Response body is null');
       }
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
+      let reader: ReadableStreamDefaultReader<string> | ReadableStreamDefaultReader<Uint8Array>;
+      let useTextDecoderStream = false;
+
+      // Try to use TextDecoderStream for robust decoding (if available)
+      try {
+        if (typeof TextDecoderStream !== 'undefined' && (response.body as any).pipeThrough) {
+          reader = (response.body as any).pipeThrough(new TextDecoderStream()).getReader();
+          useTextDecoderStream = true;
+        } else {
+          reader = response.body.getReader();
+        }
+      } catch {
+        reader = response.body.getReader();
+      }
+
+      const decoder = useTextDecoderStream ? null : new TextDecoder('utf-8');
       let buffer = '';
 
       while (true) {
         if (cancellationToken.isCancellationRequested) {
-          reader.cancel();
+          await reader.cancel();
           break;
         }
 
         const { done, value } = await reader.read();
         if (done) { break; }
 
-        buffer += decoder.decode(value, { stream: true });
+        if (useTextDecoderStream) {
+          buffer += value as string;
+        } else {
+          buffer += decoder!.decode(value as Uint8Array, { stream: true });
+        }
+
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
 
@@ -527,6 +549,17 @@ export class GatewayClient {
           const result = this.processSSELine(line, state);
           if (result) { yield result; }
         }
+      }
+
+      // Flush decoder if manual
+      if (!useTextDecoderStream && decoder) {
+        buffer += decoder.decode();
+      }
+
+      // Process remaining buffer content
+      if (buffer.trim()) {
+        const result = this.processSSELine(buffer, state);
+        if (result) { yield result; }
       }
 
       // Finalize any remaining tool calls

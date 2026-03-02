@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.0
+
+- Fixed UTF-8 decoding issues causing garbled characters (e.g. arrows) by implementing `TextDecoderStream`
+- Improved stream processing stability and ensured all data is flushed at the end of the response
+- Fixed missing property error in tool call state creation
+
 ## 1.0.9
 
 - Ensure model list refresh after server switch
