@@ -844,18 +844,34 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       this.log('debug', `  Message ${i + 1}: role=${msg.role}, hasContent=${!!msg.content}, hasToolCalls=${!!msg.tool_calls}, toolCallId=${toolCallId}`);
     }
 
-    // Calculate token limits and truncate
+    // Calculate token limits; avoid premature truncation by checking a real estimate first
     const modelMaxContext = this.config.defaultMaxTokens || 32768;
     const desiredOutputTokens = Math.min(this.config.defaultMaxOutputTokens || 2048, Math.floor(modelMaxContext / 2));
     const toolsTokenEstimate = options.tools ? Math.ceil(JSON.stringify(options.tools).length / 4 * 1.2) : 0;
-    const maxInputTokens = modelMaxContext - desiredOutputTokens - toolsTokenEstimate - 256;
+    const reservedForInput = modelMaxContext - desiredOutputTokens - toolsTokenEstimate - 256;
 
-    const truncatedMessages = this.truncateMessagesToFit(openAIMessages, maxInputTokens);
-    if (truncatedMessages.length < openAIMessages.length) {
-      this.log('warn', `Truncated conversation from ${openAIMessages.length} to ${truncatedMessages.length} messages to fit context limit`);
+    // Build input text for an initial token estimate using ALL messages
+    const fullInputText = openAIMessages
+      .map((m) => {
+        let text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '');
+        if ((m as any).tool_calls) { text += JSON.stringify((m as any).tool_calls); }
+        return text;
+      })
+      .join('\n');
+
+    const initialInputTokens = await this.provideTokenCount(model, fullInputText, token);
+
+    // Only truncate when the combined estimate truly exceeds the available context
+    let truncatedMessages = openAIMessages;
+    if (initialInputTokens > reservedForInput) {
+      const maxInputTokens = reservedForInput;
+      truncatedMessages = this.truncateMessagesToFit(openAIMessages, maxInputTokens);
+      if (truncatedMessages.length < openAIMessages.length) {
+        this.log('warn', `Truncated conversation from ${openAIMessages.length} to ${truncatedMessages.length} messages to fit context limit`);
+      }
     }
 
-    // Build input text for token estimation
+    // Build input text for token estimation (final set used in request)
     const inputText = truncatedMessages
       .map((m) => {
         let text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '');

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.1
+
+### Bug Fixes
+- Prevented premature message truncation caused by an overly conservative token estimate. We now compute a real input-token estimate for the full conversation first and only truncate when it truly exceeds the available context window. This resolves cases where input was truncated despite ample room.
+- Clearer token budgeting: context is now calculated as `model_context - desired_output - tools_overhead - buffer` and truncation is gated on the real estimate against this value.
+
 ## 1.1.0
 
 - Fixed UTF-8 decoding issues causing garbled characters (e.g. arrows) by implementing `TextDecoderStream`
