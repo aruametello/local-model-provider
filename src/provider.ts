@@ -888,7 +888,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       `Token estimate: input=${estimatedInputTokens}, tools=${toolsOverhead}, model_context=${modelMaxContext}, chosen_max_tokens=${safeMaxOutputTokens}`
     );
 
-    // Build request
+    // Build request — only include optional sampling parameters when non-default
+    // to maximize compatibility with servers like LM Studio, Ollama, llama.cpp
     const hasTools = this.config.enableToolCalling && options.tools && options.tools.length > 0;
     const temperature = hasTools ? (this.config.agentTemperature ?? 0) : 0.7;
 
@@ -897,11 +898,19 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       messages: truncatedMessages,
       max_tokens: safeMaxOutputTokens,
       temperature,
-      // Extended sampling parameters
-      top_p: this.config.topP,
-      frequency_penalty: this.config.frequencyPenalty,
-      presence_penalty: this.config.presencePenalty,
     };
+
+    // Only include sampling parameters when they differ from defaults
+    // This avoids sending unsupported fields to servers that reject unknown params
+    if (this.config.topP !== 1.0) {
+      requestOptions.top_p = this.config.topP;
+    }
+    if (this.config.frequencyPenalty !== 0) {
+      requestOptions.frequency_penalty = this.config.frequencyPenalty;
+    }
+    if (this.config.presencePenalty !== 0) {
+      requestOptions.presence_penalty = this.config.presencePenalty;
+    }
 
     const toolsConfig = this.buildToolsConfig(options);
     if (toolsConfig) {
@@ -909,7 +918,11 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       if (options.toolMode !== undefined) {
         requestOptions.tool_choice = options.toolMode === vscode.LanguageModelChatToolMode.Required ? 'required' : 'auto';
       }
-      requestOptions.parallel_tool_calls = this.config.parallelToolCalling;
+      // Only send parallel_tool_calls when explicitly enabled — some servers
+      // (e.g. LM Studio) reject requests containing unknown fields
+      if (this.config.parallelToolCalling) {
+        requestOptions.parallel_tool_calls = true;
+      }
       this.log('info', `Sending ${toolsConfig.length} tools to model (parallel: ${this.config.parallelToolCalling})`);
     }
 

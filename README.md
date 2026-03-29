@@ -28,6 +28,7 @@ A VS Code extension that connects your editor to self‑hosted or local LLMs via
 ## 🔌 Compatible Inference Servers
 
 - vLLM (recommended)
+- LM Studio
 - Ollama
 - llama.cpp
 - Text Generation Inference (Hugging Face)
@@ -72,6 +73,14 @@ A VS Code extension that connects your editor to self‑hosted or local LLMs via
   - `--enable-prefix-caching`: enable prefix/KV cache for repeated prompts
   - `--async-scheduling`: schedule requests asynchronously for better throughput
   
+- LM Studio example
+  1. Download and install [LM Studio](https://lmstudio.ai/)
+  2. Load a model in the LM Studio UI
+  3. Start the local server (default: `http://localhost:1234`)
+  4. Set `local.model.provider.serverUrl` to `http://localhost:1234`
+  
+  > **Tip:** If tool calling causes errors with your model, disable `local.model.provider.enableToolCalling` in settings.
+
 - Ollama example
   ```bash
   ollama run qwen3:8b
@@ -180,6 +189,14 @@ Empty response
 Tool call formatting issues
 1) Disable `parallelToolCalling` for unstable models
 2) Set `agentTemperature` to 0.0 for more consistent formatting
+
+LM Studio connection errors ("terminated" / "request failed")
+1) Set `serverUrl` to `http://localhost:1234` (LM Studio default port)
+2) Do NOT include `/v1` in the URL — the extension adds it automatically
+3) Disable `parallelToolCalling` — LM Studio may not support this parameter
+4) If tool calling causes crashes, disable `enableToolCalling` in settings
+5) Increase `requestTimeout` if the model takes a long time to load (e.g. 120000)
+6) Check the LM Studio server logs for detailed error messages
 
 Out‑of‑memory (OOM)
 - Reduce `--max-model-len`, use a quantized model (AWQ/GPTQ/FP8), or pick a smaller model

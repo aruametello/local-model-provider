@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.2
+
+### Improvements
+- Fixed "terminated" / "request failed" errors when connecting to LM Studio and similar servers
+- Replaced `TextDecoderStream` + `pipeThrough` with plain `TextDecoder` to avoid stream termination in certain runtimes
+- Gracefully handle stream disconnection when data has already been received (some servers close without sending `[DONE]`)
+- Added `\r\n` line ending support in SSE stream parsing
+- Only send `top_p`, `frequency_penalty`, `presence_penalty` when non-default to avoid rejection by servers that don't accept unknown parameters
+- Only send `parallel_tool_calls` when enabled (LM Studio rejects this field)
+- Improved "terminated" error messages with actionable troubleshooting steps
+- Added LM Studio to compatible servers list, keywords, and README setup guide
+
 ## 1.1.1
 
 ### Bug Fixes

@@ -509,23 +509,12 @@ export class GatewayClient {
         throw new GatewayError('Response body is null');
       }
 
-      let reader: ReadableStreamDefaultReader<string> | ReadableStreamDefaultReader<Uint8Array>;
-      let useTextDecoderStream = false;
-
-      // Try to use TextDecoderStream for robust decoding (if available)
-      try {
-        if (typeof TextDecoderStream !== 'undefined' && (response.body as any).pipeThrough) {
-          reader = (response.body as any).pipeThrough(new TextDecoderStream()).getReader();
-          useTextDecoderStream = true;
-        } else {
-          reader = response.body.getReader();
-        }
-      } catch {
-        reader = response.body.getReader();
-      }
-
-      const decoder = useTextDecoderStream ? null : new TextDecoder('utf-8');
+      // Use plain TextDecoder for maximum compatibility across runtimes
+      // (TextDecoderStream + pipeThrough can cause "terminated" errors in some environments)
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
       let buffer = '';
+      let receivedAnyData = false;
 
       while (true) {
         if (cancellationToken.isCancellationRequested) {
@@ -533,16 +522,27 @@ export class GatewayClient {
           break;
         }
 
-        const { done, value } = await reader.read();
-        if (done) { break; }
-
-        if (useTextDecoderStream) {
-          buffer += value as string;
-        } else {
-          buffer += decoder!.decode(value as Uint8Array, { stream: true });
+        let readResult: ReadableStreamReadResult<Uint8Array>;
+        try {
+          readResult = await reader.read();
+        } catch (readError) {
+          // If we already received data, treat stream termination as end-of-stream
+          // Some servers (e.g. LM Studio) close the connection without sending [DONE]
+          if (receivedAnyData) {
+            console.warn('[LLM Gateway] Stream read interrupted after receiving data, treating as end-of-stream:', readError);
+            break;
+          }
+          throw readError;
         }
 
-        const lines = buffer.split('\n');
+        const { done, value } = readResult;
+        if (done) { break; }
+
+        buffer += decoder.decode(value, { stream: true });
+        receivedAnyData = true;
+
+        // Split on \n and also handle \r\n (some servers use Windows-style line endings)
+        const lines = buffer.split(/\r?\n/);
         buffer = lines.pop() || '';
 
         for (const line of lines) {
@@ -551,10 +551,8 @@ export class GatewayClient {
         }
       }
 
-      // Flush decoder if manual
-      if (!useTextDecoderStream && decoder) {
-        buffer += decoder.decode();
-      }
+      // Flush decoder
+      buffer += decoder.decode();
 
       // Process remaining buffer content
       if (buffer.trim()) {
@@ -572,6 +570,24 @@ export class GatewayClient {
         throw error;
       }
       if (error instanceof Error) {
+        const msg = error.message?.toLowerCase() || '';
+        // Detect common connection-drop errors from various OpenAI-compatible servers
+        // (LM Studio, Ollama, llama.cpp, etc.) that close the connection unexpectedly
+        if (msg === 'terminated' || msg.includes('other side closed') ||
+            msg.includes('aborted') || msg.includes('socket hang up') ||
+            msg.includes('econnreset') || msg.includes('premature close')) {
+          throw new GatewayError(
+            `Chat completion request failed: connection was terminated by the server. ` +
+            `This often happens when the inference server does not support certain request parameters. ` +
+            `Troubleshooting: 1) Check the inference server logs for errors, ` +
+            `2) Try disabling 'parallel_tool_calls' in settings, ` +
+            `3) Try disabling tool calling entirely, ` +
+            `4) Ensure the model is fully loaded on the server.`,
+            undefined,
+            false,
+            error
+          );
+        }
         throw new GatewayError(
           `Chat completion request failed: ${error.message}`,
           undefined,
