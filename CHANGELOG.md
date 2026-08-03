@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.3
+
+### New Features
+- Added opt-in Qwen tool-loop compatibility for local reasoning models (e.g. `unsloth/Qwen3.5-9B-GGUF` via llama.cpp)
+- `qwenToolLoopCompat`: parses Qwen's raw XML-style tool calls (`<tool_call>` / `<function=...>`) into structured tool calls, and preserves reasoning across tool steps
+- `qwenFinalAnswerRetry`: when enabled alongside `qwenToolLoopCompat`, runs one no-tools retry to get a final assistant message if Qwen returns only reasoning after a tool result
+
+### Bug Fixes
+- Fixed trailing text after a Qwen XML tool call being silently dropped by resetting the XML buffering state per tool-call block instead of once per response
+
 ## 1.1.2
 
 ### Improvements
