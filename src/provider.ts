@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { GatewayClient } from './client';
-import { GatewayConfig, OpenAIChatCompletionRequest } from './types';
+import { GatewayConfig, OpenAIChatCompletionRequest, OpenAIUsage, OllamaModelCapabilities } from './types';
 import { SecretManager } from './secrets';
 import { StatisticsManager } from './statistics';
 import { parseQwenXmlToolCalls } from './qwenXml';
@@ -205,6 +205,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       const role = this.mapRole(msg.role);
       const toolResults: Record<string, unknown>[] = [];
       const toolCalls: Record<string, unknown>[] = [];
+      const imageParts: Record<string, unknown>[] = [];
       let textContent = '';
 
       for (const part of msg.content) {
@@ -214,6 +215,11 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
           toolResults.push(this.convertToolResultPart(part));
         } else if (part instanceof vscode.LanguageModelToolCallPart) {
           toolCalls.push(this.convertToolCallPart(part));
+        } else {
+          const imagePart = this.extractImageContentPart(part);
+          if (imagePart) {
+            imageParts.push(imagePart);
+          }
         }
       }
 
@@ -225,67 +231,40 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         openAIMessages.push({ role: 'assistant', content: assistantContent, tool_calls: toolCalls });
       } else if (toolResults.length > 0) {
         openAIMessages.push(...toolResults);
-      } else if (textContent) {
-        openAIMessages.push({ role, content: textContent });
+      } else if (imageParts.length > 0 || textContent) {
+        const content: unknown = imageParts.length > 0
+          ? [
+              ...(textContent ? [{ type: 'text', text: textContent }] : []),
+              ...imageParts,
+            ]
+          : textContent;
+        openAIMessages.push({ role, content });
       }
     }
 
     return openAIMessages;
   }
 
-  // Helper method: buildRequestOptions
-  private buildRequestOptions(
-    model: vscode.LanguageModelChatInformation,
-    openAIMessages: any[],
-    estimatedInputTokens: number
-  ): any {
-    const modelMaxContext = this.config.defaultMaxTokens || 32768;
-    const bufferTokens = 128;
-    let safeMaxOutputTokens = Math.min(
-      this.config.defaultMaxOutputTokens || 2048,
-      Math.floor(modelMaxContext - estimatedInputTokens - bufferTokens)
-    );
-    if (safeMaxOutputTokens < 64) {
-      safeMaxOutputTokens = Math.max(64, Math.floor((this.config.defaultMaxOutputTokens || 2048) / 2));
+  /**
+   * Detect a VS Code image data part (`LanguageModelDataPart`) via duck-typing so it
+   * works across VS Code versions (the class is only present in newer releases), and
+   * convert it to an OpenAI `image_url` content part using a base64 data URL.
+   * Returns undefined for non-image parts.
+   */
+  private extractImageContentPart(part: unknown): Record<string, unknown> | undefined {
+    const p = part as { mimeType?: string; data?: Uint8Array } | null;
+    if (!p || typeof p.mimeType !== 'string' || !p.mimeType.startsWith('image/') || !p.data) {
+      return undefined;
     }
-
-    this.outputChannel.appendLine(
-      `Token estimate: input=${estimatedInputTokens}, model_context=${modelMaxContext}, chosen_max_tokens=${safeMaxOutputTokens}`
-    );
-
-    const requestOptions: any = {
-      model: model.id,
-      messages: openAIMessages,
-      max_tokens: safeMaxOutputTokens,
-      temperature: 0.7,
+    const base64 = Buffer.from(p.data).toString('base64');
+    return {
+      type: 'image_url',
+      image_url: { url: `data:${p.mimeType};base64,${base64}` },
     };
-
-    return requestOptions;
   }
 
-  // Helper method: addTooling
-  private addTooling(
-    requestOptions: any,
-    options: vscode.ProvideLanguageModelChatResponseOptions
-  ): void {
-    if (this.config.enableToolCalling && options.tools && options.tools.length > 0) {
-      requestOptions.tools = options.tools.map((tool) => ({
-        type: 'function',
-        function: {
-          name: tool.name,
-          description: tool.description,
-          parameters: tool.inputSchema,
-        },
-      }));
-
-      if (options.toolMode !== undefined) {
-        requestOptions.tool_choice = options.toolMode === vscode.LanguageModelChatToolMode.Required ? 'required' : 'auto';
-      }
-
-      requestOptions.parallel_tool_calls = this.config.parallelToolCalling;
-      this.outputChannel.appendLine(`Sending ${requestOptions.tools.length} tools to model (parallel: ${this.config.parallelToolCalling})`);
-    }
-  }
+  // NOTE: sampling parameters (temperature, top_p, frequency/presence penalties)
+  // are intentionally never sent — the upstream server's own defaults are used.
 
   /**
    * Get default value for a JSON schema type
@@ -355,18 +334,48 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   }
 
   /**
-   * Estimate token count for a message
+   * Approximate token cost of a single image. Vision models downscale inputs,
+   * so a fixed budget (~150 tokens) is far more stable than counting the
+   * base64 payload, which would otherwise dominate the estimate.
    */
-  private estimateMessageTokens(message: any): number {
+  private static readonly ESTIMATED_IMAGE_TOKENS = 150;
+
+  /**
+   * Build an estimable text representation of an OpenAI-format message.
+   * Image content parts are replaced with a fixed-length placeholder so their
+   * base64 data does not inflate the character-based token estimate.
+   */
+  private extractEstimableText(message: Record<string, unknown>): string {
     let text = '';
-    if (typeof message.content === 'string') {
-      text = message.content;
-    } else if (message.content) {
-      text = JSON.stringify(message.content);
+    const content = message.content;
+    if (typeof content === 'string') {
+      text = content;
+    } else if (Array.isArray(content)) {
+      for (const part of content) {
+        const p = part as Record<string, unknown>;
+        if (p?.type === 'image_url' || p?.type === 'input_image') {
+          // ~4 chars per token to match the estimate below
+          text += ' '.repeat(GatewayProvider.ESTIMATED_IMAGE_TOKENS * 4);
+        } else if (typeof p?.text === 'string') {
+          text += p.text;
+        } else {
+          text += JSON.stringify(part ?? '');
+        }
+      }
+    } else if (content) {
+      text = JSON.stringify(content);
     }
     if (message.tool_calls) {
       text += JSON.stringify(message.tool_calls);
     }
+    return text;
+  }
+
+  /**
+   * Estimate token count for a message
+   */
+  private estimateMessageTokens(message: any): number {
+    const text = this.extractEstimableText(message);
     // Rough estimate: ~4 characters per token
     return Math.ceil(text.length / 4);
   }
@@ -569,18 +578,25 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
     try {
       this.log('info', 'Fetching models from inference server...');
-      const response = await this.client.fetchModels();
+      const [response, ollamaCaps] = await Promise.all([
+        this.client.fetchModels(),
+        this.client.fetchOllamaCapabilities(),
+      ]);
+
+      const visionOverrides = this.config.visionModels ?? [];
 
       const models = response.data.map((model) => {
+        const imageInput = this.detectVision(model.id, model, ollamaCaps, visionOverrides);
         const modelInfo: vscode.LanguageModelChatInformation = {
           id: model.id,
           name: model.id,
-          family: 'local-model-provider',
+          family: 'custom-local-model-provider',
           maxInputTokens: this.config.defaultMaxTokens,
           maxOutputTokens: this.config.defaultMaxOutputTokens,
           version: '1.0.0',
           capabilities: {
-            toolCalling: this.config.enableToolCalling
+            toolCalling: this.config.enableToolCalling,
+            imageInput,
           },
         };
 
@@ -591,7 +607,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       this.cachedModels = models;
       this.modelCacheTimestamp = now;
 
-      this.log('info', `Found ${models.length} models: ${models.map(m => m.id).join(', ')}`);
+      const visionCount = models.filter(m => m.capabilities?.imageInput).length;
+      this.log('info', `Found ${models.length} models (${visionCount} with image input): ${models.map(m => m.id).join(', ')}`);
       return models;
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -609,6 +626,75 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
       return [];
     }
+  }
+
+  /**
+   * Determine whether a model accepts image input, using layered detection:
+   * 1. User override via the `visionModels` setting (exact id match) — wins.
+   * 2. Ollama native /api/tags capabilities ("vision").
+   * 3. Opportunistic non-standard fields on the OpenAI model object
+   *    (e.g. architecture.input_modalities containing "image").
+   * 4. Model-id heuristic for common vision families.
+   */
+  private detectVision(
+    modelId: string,
+    model: { capabilities?: string[]; architecture?: { input_modalities?: string[] } },
+    ollamaCaps: OllamaModelCapabilities,
+    overrides: string[]
+  ): boolean {
+    // 1. Explicit user override (case-insensitive exact match)
+    const normalizedId = modelId.toLowerCase();
+    if (overrides.length > 0) {
+      const matched = overrides.some((o) => o.trim().toLowerCase() === normalizedId);
+      if (matched) {
+        return true;
+      }
+    }
+
+    // 2. Ollama native capabilities. Ollama names may be tagged ("llava:7b")
+    // while OpenAI-style ids are often bare ("llava"), so try exact,
+    // slash-stripped, and tag-stripped matches.
+    const baseName = modelId.replace(/^.*\//, '');
+    const candidates = [ollamaCaps[modelId], ollamaCaps[baseName]];
+    if (!candidates.some((c) => Array.isArray(c))) {
+      for (const key of Object.keys(ollamaCaps)) {
+        const keyBase = key.split(':')[0];
+        if (keyBase === baseName || baseName.startsWith(keyBase + ':')) {
+          candidates.push(ollamaCaps[key]);
+          break;
+        }
+      }
+    }
+    const ollamaCapabilities = candidates.find((c) => Array.isArray(c));
+    if (ollamaCapabilities) {
+      return ollamaCapabilities.includes('vision');
+    }
+
+    // 3. Opportunistic fields on the model object from /v1/models
+    if (model.capabilities?.includes('vision')) {
+      return true;
+    }
+    const modalities = model.architecture?.input_modalities ?? [];
+    if (modalities.includes('image') || modalities.includes('img')) {
+      return true;
+    }
+
+    // 4. Heuristic on the model id for well-known vision families
+    const heuristicPatterns = [
+      /-vl[-_.]/i,        // Qwen2-VL, llama-3.2-vision... (also matches "vl" suffix via next)
+      /-vl$/i,
+      /\bvision\b/i,
+      /llava/i,
+      /minicpm.?v/i,
+      /gemma3/i,          // Gemma 3 is multimodal by default
+      /pixtral/i,
+      /moondream/i,
+      /bakllava/i,
+      /internvl/i,
+      /phi-?3.*vision/i,
+      /-v[0-9]/i,         // e.g. "smolvlm", less reliable but low risk
+    ];
+    return heuristicPatterns.some((re) => re.test(normalizedId));
   }
 
   /**
@@ -647,6 +733,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     const role = this.mapRole(msg.role);
     const toolResults: Record<string, unknown>[] = [];
     const toolCalls: Record<string, unknown>[] = [];
+    const imageParts: Record<string, unknown>[] = [];
     let textContent = '';
 
     for (const part of msg.content) {
@@ -659,7 +746,13 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         this.outputChannel.appendLine(`  Found tool call: callId=${part.callId}, name=${part.name}`);
         toolCalls.push(this.convertToolCallPart(part));
       } else {
-        this.processPartDuckTyped(part, toolResults, toolCalls);
+        const imagePart = this.extractImageContentPart(part);
+        if (imagePart) {
+          this.outputChannel.appendLine('  Found image part (will be sent as image_url)');
+          imageParts.push(imagePart);
+        } else {
+          this.processPartDuckTyped(part, toolResults, toolCalls);
+        }
       }
     }
 
@@ -670,10 +763,21 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         ? `${preservedReasoning}${textContent ? `\n\n${textContent}` : ''}`
         : textContent || null;
       result.push({ role: 'assistant', content: assistantContent, tool_calls: toolCalls });
-    } else if (toolResults.length > 0) {
-      result.push(...toolResults);
-    } else if (textContent) {
-      result.push({ role, content: textContent });
+    } else {
+      if (toolResults.length > 0) {
+        result.push(...toolResults);
+      }
+      // Emit a multimodal content array when the message carries images,
+      // otherwise fall back to plain string content as before.
+      if (imageParts.length > 0 || textContent) {
+        const content: unknown = imageParts.length > 0
+          ? [
+              ...(textContent ? [{ type: 'text', text: textContent }] : []),
+              ...imageParts,
+            ]
+          : textContent;
+        result.push({ role, content });
+      }
     }
     return result;
   }
@@ -828,6 +932,26 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   }
 
   /**
+   * Extract the final answer from a reasoning stream when a server emits it
+   * inside `reasoning_content` (common with Ollama + thinking models). The
+   * answer is whatever follows the last closing thinking tag.
+   */
+  private extractAnswerFromReasoning(reasoning: string): string {
+    const markers = ['</thinking>', '</think>'];
+    let answerStart = -1;
+    for (const marker of markers) {
+      const idx = reasoning.lastIndexOf(marker);
+      if (idx > answerStart) {
+        answerStart = idx + marker.length;
+      }
+    }
+    if (answerStart <= 0) {
+      return '';
+    }
+    return reasoning.slice(answerStart).trim();
+  }
+
+  /**
    * Qwen can return only reasoning after a tool result. Do one no-tools
    * finalization pass so VS Code receives normal assistant content.
    */
@@ -853,7 +977,6 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     const retryOptions: Record<string, unknown> = {
       ...baseRequestOptions,
       messages: finalMessages,
-      temperature: 0,
       max_tokens: Math.min(Number(baseRequestOptions.max_tokens) || 4096, 4096),
     };
     delete retryOptions.tools;
@@ -960,13 +1083,11 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     const toolsTokenEstimate = options.tools ? Math.ceil(JSON.stringify(options.tools).length / 4 * 1.2) : 0;
     const reservedForInput = modelMaxContext - desiredOutputTokens - toolsTokenEstimate - 256;
 
-    // Build input text for an initial token estimate using ALL messages
+    // Build input text for an initial token estimate using ALL messages.
+    // Image parts are normalized to a fixed placeholder so base64 payloads
+    // do not distort the character-based estimate (see extractEstimableText).
     const fullInputText = openAIMessages
-      .map((m) => {
-        let text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '');
-        if ((m as any).tool_calls) { text += JSON.stringify((m as any).tool_calls); }
-        return text;
-      })
+      .map((m) => this.extractEstimableText(m))
       .join('\n');
 
     const initialInputTokens = await this.provideTokenCount(model, fullInputText, token);
@@ -998,29 +1119,14 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       `Token estimate: input=${estimatedInputTokens}, tools=${toolsOverhead}, model_context=${modelMaxContext}, chosen_max_tokens=${safeMaxOutputTokens}`
     );
 
-    // Build request — only include optional sampling parameters when non-default
-    // to maximize compatibility with servers like LM Studio, Ollama, llama.cpp
-    const hasTools = this.config.enableToolCalling && options.tools && options.tools.length > 0;
-    const temperature = hasTools ? (this.config.agentTemperature ?? 0) : 0.7;
-
+    // Build request. Sampling parameters (temperature, top_p, frequency/presence
+    // penalties) are intentionally NOT sent so the upstream server's own defaults
+    // apply (llama.cpp, vLLM, LM Studio, Ollama, ...).
     const requestOptions: Record<string, unknown> = {
       model: model.id,
       messages: truncatedMessages,
       max_tokens: safeMaxOutputTokens,
-      temperature,
     };
-
-    // Only include sampling parameters when they differ from defaults
-    // This avoids sending unsupported fields to servers that reject unknown params
-    if (this.config.topP !== 1.0) {
-      requestOptions.top_p = this.config.topP;
-    }
-    if (this.config.frequencyPenalty !== 0) {
-      requestOptions.frequency_penalty = this.config.frequencyPenalty;
-    }
-    if (this.config.presencePenalty !== 0) {
-      requestOptions.presence_penalty = this.config.presencePenalty;
-    }
 
     const toolsConfig = this.buildToolsConfig(options);
     if (toolsConfig) {
@@ -1053,9 +1159,21 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       let xmlToolBuffer = '';
       let bufferingXmlToolCall = false;
       let totalToolCalls = 0;
+      let lastFinishReason: string | undefined;
+      let lastUsage: OpenAIUsage | undefined;
 
       for await (const chunk of this.client.streamChatCompletion(requestOptions as unknown as OpenAIChatCompletionRequest, token)) {
         if (token.isCancellationRequested) { break; }
+
+        if (chunk.finish_reason) {
+          lastFinishReason = chunk.finish_reason;
+        }
+
+        // Servers with stream_options.include_usage send the final usage object
+        // in a trailing chunk (often with an empty choices array).
+        if (chunk.usage) {
+          lastUsage = chunk.usage;
+        }
 
         // Handle reasoning/thinking content from the model
         if (chunk.reasoning_content) {
@@ -1118,35 +1236,64 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
       this.outputChannel.appendLine(`Completed chat request, received ${totalContent.length} characters, ${totalReasoningContent.length} reasoning characters, ${totalToolCalls} tool calls`);
 
-      // Record statistics
+      // Report server-reported token usage to VS Code so the chat context-window
+      // meter (and conversation compaction) tracks REAL token counts. VS Code
+      // consumes a data part with mimeType 'usage' whose payload is an
+      // OpenAI-shaped usage object — the same mechanism its built-in BYOK
+      // providers use. Duck-typed for older runtimes without LanguageModelDataPart.
+      if (lastUsage && typeof (vscode as any).LanguageModelDataPart !== 'undefined') {
+        const usageJson = JSON.stringify(lastUsage);
+        progress.report(new (vscode as any).LanguageModelDataPart(
+          new TextEncoder().encode(usageJson),
+          'usage',
+        ));
+        this.log('info', `Reported token usage to VS Code: prompt=${lastUsage.prompt_tokens}, completion=${lastUsage.completion_tokens}, total=${lastUsage.total_tokens}`);
+      }
+
+      // Record statistics — prefer the server's real counts over estimates
       const responseTimeMs = Date.now() - requestStartTime;
-      const outputTokens = Math.ceil((totalContent.length + totalReasoningContent.length) / 4);
+      const outputTokens = lastUsage
+        ? lastUsage.completion_tokens
+        : Math.ceil((totalContent.length + totalReasoningContent.length) / 4);
       if (this.statsManager) {
         this.statsManager.recordRequest({
           modelId: model.id,
-          inputTokens: estimatedInputTokens,
+          inputTokens: lastUsage ? lastUsage.prompt_tokens : estimatedInputTokens,
           outputTokens,
           responseTimeMs,
         });
       }
-      this.log('info', `Response time: ${responseTimeMs}ms, Input tokens: ${estimatedInputTokens}, Output tokens: ~${outputTokens}`);
+      this.log('info', `Response time: ${responseTimeMs}ms, Input tokens: ${lastUsage ? lastUsage.prompt_tokens : `~${estimatedInputTokens}`}, Output tokens: ${lastUsage ? outputTokens : `~${outputTokens}`}`);
 
       if (totalContent.length === 0 && totalToolCalls === 0) {
         if (totalReasoningContent.length > 0) {
+          // Some servers (notably Ollama with certain thinking models) emit the
+          // final answer inside the reasoning stream, after the closing
+          // thinking tag. Salvage it instead of surfacing an error.
+          const salvaged = this.extractAnswerFromReasoning(totalReasoningContent);
+          if (salvaged) {
+            this.log('info', `Salvaged ${salvaged.length} characters of final answer from the reasoning stream.`);
+            progress.report(new vscode.LanguageModelTextPart(salvaged));
+            return;
+          }
+
           const hasToolResults = openAIMessages.some((message) => message.role === 'tool');
-          if (hasToolResults && this.config.qwenToolLoopCompat && this.config.qwenFinalAnswerRetry) {
+          if (this.config.finalAnswerRetry || (hasToolResults && this.config.qwenToolLoopCompat && this.config.qwenFinalAnswerRetry)) {
             const retried = await this.retryQwenFinalAnswer(requestOptions, truncatedMessages, totalReasoningContent, progress, token);
             if (retried) {
               return;
             }
           }
 
+          const finishHint = lastFinishReason === 'length'
+            ? ' Generation stopped at the maximum output token limit — thinking models spend the whole budget reasoning before answering. Increase "Local Model Provider: Default Max Output Tokens" and try again.'
+            : '';
           const message = hasToolResults
             ? 'The tool call completed, but the model produced reasoning without a final summary. Check the tool result above for the completed action.'
             : xmlToolBuffer.includes('<tool_call')
               ? 'The model started a tool call in its reasoning stream but did not complete a structured tool call before generation stopped. Try again with a narrower request, or reduce the reasoning budget if this keeps happening.'
-              : 'The model produced reasoning but no final answer or tool call. Try again with a narrower request, or reduce the reasoning budget if this keeps happening.';
-          this.log('warn', `Model returned reasoning-only response (${totalReasoningContent.length} reasoning characters).`);
+              : `The model produced reasoning but no final answer or tool call. Try again with a narrower request, or reduce the reasoning budget if this keeps happening.${finishHint}`;
+          this.log('warn', `Model returned reasoning-only response (${totalReasoningContent.length} reasoning characters, finish_reason=${lastFinishReason ?? 'unknown'}).`);
           progress.report(new vscode.LanguageModelTextPart(message));
         } else {
           await this.handleEmptyResponse(model, inputText, openAIMessages.length, requestOptions.tools ? (requestOptions.tools as unknown[]).length : 0, token, progress);
@@ -1169,18 +1316,27 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     // This is a rough estimate; for more accuracy, could use tiktoken library
     let content: string;
 
+    let imageTokens = 0;
     if (typeof text === 'string') {
       content = text;
     } else {
-      // Filter and extract only text parts from the message content
+      // Extract text parts and account for image parts with a fixed budget so
+      // vision requests are not under-estimated (base64 is not counted).
       content = text.content
-        .filter((part): part is vscode.LanguageModelTextPart => part instanceof vscode.LanguageModelTextPart)
-        .map((part) => part.value)
+        .map((part) => {
+          if (part instanceof vscode.LanguageModelTextPart) {
+            return part.value;
+          }
+          if (this.extractImageContentPart(part)) {
+            imageTokens += GatewayProvider.ESTIMATED_IMAGE_TOKENS;
+          }
+          return '';
+        })
         .join('');
     }
 
     const estimatedTokens = Math.ceil(content.length / 4);
-    return estimatedTokens;
+    return estimatedTokens + imageTokens;
   }
 
   /**
@@ -1225,15 +1381,13 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       parallelToolCalling: config.get<boolean>('parallelToolCalling', true),
       qwenToolLoopCompat: config.get<boolean>('qwenToolLoopCompat', false),
       qwenFinalAnswerRetry: config.get<boolean>('qwenFinalAnswerRetry', true),
-      agentTemperature: config.get<number>('agentTemperature', 0),
-      // Extended options
-      topP: config.get<number>('topP', 1.0),
-      frequencyPenalty: config.get<number>('frequencyPenalty', 0.0),
-      presencePenalty: config.get<number>('presencePenalty', 0.0),
+      finalAnswerRetry: config.get<boolean>('finalAnswerRetry', true),
+      includeUsageInStream: config.get<boolean>('includeUsageInStream', true),
       maxRetries: config.get<number>('maxRetries', 3),
       retryDelayMs: config.get<number>('retryDelayMs', 1000),
       modelCacheTtlMs: config.get<number>('modelCacheTtlMs', 300000),
       logLevel: config.get<'debug' | 'info' | 'warn' | 'error'>('logLevel', 'info'),
+      visionModels: config.get<string[]>('visionModels', []),
     };
 
     // Validate requestTimeout

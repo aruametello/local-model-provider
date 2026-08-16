@@ -1,5 +1,48 @@
 # Changelog
 
+## 1.2.1
+
+### Removed
+- Removed the `agentTemperature`, `topP`, `frequencyPenalty`, and `presencePenalty` settings entirely: the extension no longer sends **any** sampling parameters (`temperature`, `top_p`, penalties) in requests, so the upstream server's own defaults (e.g. llama.cpp's `-temp`, `--top-p`) always apply
+- Removed dead code: the unused `buildRequestOptions()`/`addTooling()` helpers that hardcoded `temperature: 0.7`
+
+## 1.2.0
+
+### Breaking Changes
+- Changed the extension id from `krevas.local-model-provider` to **`krevas.local-model-provider-custom`** (new `"name"` field), so this fork can now be installed **side by side** with the official marketplace version instead of replacing it. All contributed commands moved to the `local-model-provider-custom.*` namespace and the language-model vendor id is now `custom-local-model-provider`.
+- If you had the 1.1.x fork installed, uninstall it first (`code --uninstall-extension krevas.local-model-provider`) — otherwise the official marketplace extension may overwrite it while this one installs under the new id.
+
+## 1.1.6
+
+### Improvements
+- Renamed to **"(custom) Local Model Provider"** (display name, command categories, settings title, model-picker vendor group) to mark this as a fork of `krevas/local-model-provider`
+- Added `install_build/` portable installer: drop the folder on any Windows machine and run `install.bat` to install the bundled `.vsix` into an existing VS Code install (no Node.js or Marketplace access required)
+
+## 1.1.5
+
+### New Features
+- Real token-usage reporting to VS Code: the extension now sends `stream_options: { include_usage: true }` (llama.cpp, vLLM, OpenAI-compatible servers) and reports the server's final `usage` object back to VS Code as a `'usage'` data part — the same mechanism VS Code's built-in BYOK providers use. This feeds the chat **context-window meter** ("X / 260K tokens") and conversation compaction with real numbers instead of estimates
+- New setting `local.model.provider.includeUsageInStream` (default on) to disable the request for servers that reject unknown fields
+- Session statistics now prefer the server's real `prompt_tokens`/`completion_tokens` over character-based estimates when available
+
+### Bug Fixes
+- Fixed SSE parser dropping trailing usage chunks: llama.cpp-style usage arrives in a chunk with an **empty `choices` array**, which previously produced no yield at all
+
+## 1.1.4
+
+### New Features
+- Vision (image) input support: models are now advertised to VS Code with `capabilities.imageInput` when they accept images, so image attachments in Copilot Chat are routed to them
+  - Capability detection is layered: `local.model.provider.visionModels` override → Ollama native `/api/tags` (`vision` capability) → opportunistic server fields → model-id heuristics (e.g. `-vl`, `llava`, `minicpm-v`, `gemma3`)
+  - Image parts are forwarded to the upstream server as OpenAI-style `image_url` content parts (base64 data URLs)
+  - New setting `local.model.provider.visionModels` (array of model IDs) to force vision on for models whose servers don't expose capabilities
+  - Model picker now shows `Vision: Yes/No` per model
+
+### Bug Fixes
+- Fixed "The model produced reasoning but no final answer" on thinking/reasoning models (common with image inputs): the final answer is now salvaged from the reasoning stream when a server emits it after the closing `</thinking>` tag
+- New setting `local.model.provider.finalAnswerRetry` (default on): runs one extra no-tools request for the final answer whenever a response contains only reasoning, generalizing the previous Qwen-only retry
+- Reasoning-only responses now report the upstream `finish_reason`; when generation stopped at the token limit (`length`), the error message tells you to increase "Default Max Output Tokens" (thinking models can spend their whole budget reasoning before answering)
+- Token estimation no longer counts base64 image payloads; each image uses a fixed ~150-token budget so vision requests are neither truncated nor over-truncated
+
 ## 1.1.3
 
 ### New Features

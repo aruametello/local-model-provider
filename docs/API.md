@@ -98,10 +98,7 @@ interface GatewayConfig {
   defaultMaxOutputTokens: number; // Max output tokens
   enableToolCalling: boolean;  // Enable function calling
   parallelToolCalling: boolean; // Allow parallel tool calls
-  agentTemperature: number;    // Temperature for tool mode
-  topP: number;                // Nucleus sampling parameter
-  frequencyPenalty: number;    // Reduce token repetition
-  presencePenalty: number;     // Encourage new topics
+  // NOTE: no sampling parameters (temperature/top_p/penalties) — the server's own defaults are used
   maxRetries: number;          // Max retry attempts
   retryDelayMs: number;        // Base retry delay
   modelCacheTtlMs: number;     // Model list cache duration
@@ -120,10 +117,6 @@ The extension supports quick configuration for common inference servers:
 | llama.cpp | http://localhost:8080 | Lightweight option |
 | LM Studio | http://localhost:1234 | User-friendly GUI |
 | Custom | User-defined | Any OpenAI-compatible server |
-  agentTemperature: number;    // Temperature for tool mode
-  topP: number;                // Nucleus sampling parameter
-  frequencyPenalty: number;    // Reduce token repetition
-  presencePenalty: number;     // Encourage new topics
   maxRetries: number;          // Max retry attempts
   retryDelayMs: number;        // Base retry delay
   modelCacheTtlMs: number;     // Model list cache duration

@@ -69,7 +69,7 @@ export class StatusBarManager implements vscode.Disposable {
       vscode.StatusBarAlignment.Right,
       100
     );
-    this.statusBarItem.command = 'local-model-provider.showStatus';
+    this.statusBarItem.command = 'local-model-provider-custom.showStatus';
     this.updateDisplay();
     this.statusBarItem.show();
   }
@@ -202,22 +202,22 @@ export class StatusBarManager implements vscode.Disposable {
     }
 
     if (selected.label.includes('View Models')) {
-      vscode.commands.executeCommand('local-model-provider.selectModel');
+      vscode.commands.executeCommand('local-model-provider-custom.selectModel');
     } else if (selected.label.includes('Switch Server')) {
-      vscode.commands.executeCommand('local-model-provider.switchServer');
+      vscode.commands.executeCommand('local-model-provider-custom.switchServer');
     } else if (selected.label.includes('View Statistics')) {
-      vscode.commands.executeCommand('local-model-provider.showStats');
+      vscode.commands.executeCommand('local-model-provider-custom.showStats');
     } else if (selected.label.includes('Refresh Models')) {
-      vscode.commands.executeCommand('local-model-provider.refreshModels');
+      vscode.commands.executeCommand('local-model-provider-custom.refreshModels');
     } else if (selected.label.includes('Open Settings')) {
       vscode.commands.executeCommand(
         'workbench.action.openSettings',
         'local.model.provider'
       );
     } else if (selected.label.includes('Set API Key')) {
-      vscode.commands.executeCommand('local-model-provider.setApiKey');
+      vscode.commands.executeCommand('local-model-provider-custom.setApiKey');
     } else if (selected.label.includes('Show Output')) {
-      vscode.commands.executeCommand('local-model-provider.showOutput');
+      vscode.commands.executeCommand('local-model-provider-custom.showOutput');
     }
   }
 

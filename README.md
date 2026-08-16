@@ -1,4 +1,7 @@
-# Local Model Provider
+# (custom) Local Model Provider
+
+> Custom fork of [krevas/local-model-provider](https://github.com/krevas/local-model-provider) — adds vision (image input) support and real token-usage reporting to VS Code's context-window meter.
+
 ![VS Code](https://img.shields.io/badge/Visual_Studio_Code-007ACC?style=for-the-badge&logo=visual-studio-code&logoColor=white)
 ![Local LLM](https://img.shields.io/badge/Local_LLM-f39c12?style=for-the-badge&logo=amazoneks&logoColor=white)
 ![Maintenance](https://img.shields.io/badge/Maintained%3F-yes-green.svg?style=for-the-badge)
@@ -37,8 +40,23 @@ A VS Code extension that connects your editor to self‑hosted or local LLMs via
 
 ## 📥 Installation
 
-1) Install “Local Model Provider” from the VS Code Marketplace.
-2) Reload VS Code if prompted.
+**Portable installer (recommended for this fork):**
+
+1) Copy the `install_build` folder to the target machine (USB stick, network share, …).
+2) Run `install_build\install.bat` — it installs the bundled `.vsix` into your existing VS Code install.
+3) Reload VS Code (`Developer: Reload Window`) if prompted.
+
+**From source:**
+
+```bash
+npm run esbuild && npm run package
+code --install-extension .\local-model-provider-custom-<version>.vsix
+```
+
+> Note: this fork is not published to the VS Code Marketplace; use the installer or build from source.
+> Since 1.2.0 it uses its own id (`krevas.local-model-provider-custom`) and can be installed
+> **side by side** with the official `krevas.local-model-provider`. If you had a 1.1.x build of
+> this fork, uninstall it first: `code --uninstall-extension krevas.local-model-provider`.
 
 ## 🚀 Quick Start
 
@@ -135,12 +153,8 @@ All settings are under the `local.model.provider.*` namespace.
 - `parallelToolCalling` (boolean): allow parallel tool calls (default true)
 - `qwenToolLoopCompat` (boolean): enable Qwen-specific compatibility for XML-style tool calls and reasoning-only post-tool responses (default false)
 - `qwenFinalAnswerRetry` (boolean): when Qwen compatibility is enabled, run one no-tools final-answer retry after reasoning-only tool responses (default true)
-- `agentTemperature` (number): temperature with tools (default 0.0)
 
-### Sampling Parameters
-- `topP` (number): nucleus sampling (default 1.0)
-- `frequencyPenalty` (number): repetition penalty (default 0.0)
-- `presencePenalty` (number): topic shift encouragement (default 0.0)
+> Sampling parameters (temperature, top‑p, frequency/presence penalties) are intentionally **not** exposed: the extension never sends them, so your server's own defaults (e.g. llama.cpp's) always apply.
 
 ### Reliability & Performance
 - `maxRetries` (number): retry attempts (default 3)
@@ -190,7 +204,7 @@ Empty response
 
 Tool call formatting issues
 1) Disable `parallelToolCalling` for unstable models
-2) Set `agentTemperature` to 0.0 for more consistent formatting
+2) Lower the server-side temperature (e.g. llama.cpp's `-temp 0`) for more consistent tool-call formatting — the extension never overrides sampling parameters
 3) For Qwen models that emit raw XML tool calls such as `<tool_call>` or return only reasoning after tools complete, enable `qwenToolLoopCompat`
 
 LM Studio connection errors ("terminated" / "request failed")

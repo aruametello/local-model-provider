@@ -7,6 +7,16 @@ export interface OpenAIModel {
   object: string;
   created: number;
   owned_by: string;
+  // Non-standard fields exposed by some servers (e.g. Ollama, LM Studio)
+  capabilities?: string[];
+  architecture?: { input_modalities?: string[] };
+}
+
+/**
+ * Per-model capability info from Ollama's native /api/tags endpoint
+ */
+export interface OllamaModelCapabilities {
+  [modelId: string]: string[];
 }
 
 export interface OpenAIModelsResponse {
@@ -31,12 +41,22 @@ export interface OpenAIMessage {
 export interface OpenAIChatCompletionRequest {
   model: string;
   messages: OpenAIMessage[];
-  temperature?: number;
   max_tokens?: number;
   stream?: boolean;
-  top_p?: number;
-  frequency_penalty?: number;
-  presence_penalty?: number;
+  // NOTE: sampling parameters (temperature, top_p, frequency/presence penalties)
+  // are intentionally NOT sent — the upstream server's own defaults are used.
+  // Requests the server to include a usage object in the final streamed chunk
+  stream_options?: { include_usage?: boolean };
+}
+
+/**
+ * Token usage statistics reported by servers that support
+ * `stream_options.include_usage` (OpenAI, llama.cpp, vLLM, ...).
+ */
+export interface OpenAIUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
 }
 
 export interface OpenAIChatCompletionChunk {
@@ -92,13 +112,12 @@ export interface GatewayConfig {
   parallelToolCalling: boolean;
   qwenToolLoopCompat: boolean;
   qwenFinalAnswerRetry: boolean;
-  agentTemperature: number;
-  // New extended options
-  topP: number;
-  frequencyPenalty: number;
-  presencePenalty: number;
+  finalAnswerRetry: boolean;
+  includeUsageInStream: boolean;
   maxRetries: number;
   retryDelayMs: number;
   modelCacheTtlMs: number;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
+  // Model ids (case-insensitive) that should be advertised as supporting image input
+  visionModels: string[];
 }

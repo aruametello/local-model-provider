@@ -26,7 +26,7 @@ export function activate(context: vscode.ExtensionContext) {
   const provider = new GatewayProvider(context, statsManager);
 
   const disposable = vscode.lm.registerLanguageModelChatProvider(
-    'local-model-provider',
+    'custom-local-model-provider',
     provider
   );
 
@@ -41,7 +41,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Register command to set API key securely
   const setApiKeyCommand = vscode.commands.registerCommand(
-    'local-model-provider.setApiKey',
+    'local-model-provider-custom.setApiKey',
     async () => {
       const secretManager = provider.getSecretManager();
       const hasExisting = await secretManager.hasApiKey();
@@ -84,13 +84,13 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Register command to show status menu
   const showStatusCommand = vscode.commands.registerCommand(
-    'local-model-provider.showStatus',
+    'local-model-provider-custom.showStatus',
     () => statusBar.showStatusMenu()
   );
 
   // Register command to view and select models
   const selectModelCommand = vscode.commands.registerCommand(
-    'local-model-provider.selectModel',
+    'local-model-provider-custom.selectModel',
     async () => {
       try {
         const models = await provider.provideLanguageModelChatInformation(
@@ -109,7 +109,7 @@ export function activate(context: vscode.ExtensionContext) {
         const items: vscode.QuickPickItem[] = models.map((model) => ({
           label: model.id === currentDefault ? `$(star-full) ${model.name}` : `$(symbol-method) ${model.name}`,
           description: model.id === currentDefault ? 'Default' : '',
-          detail: `Max Input: ${model.maxInputTokens} | Max Output: ${model.maxOutputTokens} | Tool Calling: ${model.capabilities?.toolCalling ? 'Yes' : 'No'}`,
+          detail: `Max Input: ${model.maxInputTokens} | Max Output: ${model.maxOutputTokens} | Tool Calling: ${model.capabilities?.toolCalling ? 'Yes' : 'No'} | Vision: ${model.capabilities?.imageInput ? 'Yes' : 'No'}`,
         }));
 
         const selected = await vscode.window.showQuickPick(items, {
@@ -135,7 +135,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Register command to switch server presets
   const switchServerCommand = vscode.commands.registerCommand(
-    'local-model-provider.switchServer',
+    'local-model-provider-custom.switchServer',
     async () => {
       const config = vscode.workspace.getConfiguration('local.model.provider');
       const presets = config.get<ServerPreset[]>('serverPresets', []);
@@ -363,7 +363,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Register command to show statistics
   const showStatsCommand = vscode.commands.registerCommand(
-    'local-model-provider.showStats',
+    'local-model-provider-custom.showStats',
     async () => {
       const stats = statsManager.getSessionStats();
       const modelStats = statsManager.getModelStats();
@@ -401,7 +401,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Register command to refresh model cache
   const refreshModelsCommand = vscode.commands.registerCommand(
-    'local-model-provider.refreshModels',
+    'local-model-provider-custom.refreshModels',
     async () => {
       provider.clearModelCache();
       vscode.window.withProgress(
@@ -438,7 +438,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Register command to show output channel
   const showOutputCommand = vscode.commands.registerCommand(
-    'local-model-provider.showOutput',
+    'local-model-provider-custom.showOutput',
     () => {
       provider.getOutputChannel().show();
     }
@@ -468,7 +468,7 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  console.log('Local Model Provider registered with vendor ID: local-model-provider');
+  console.log('(custom) Local Model Provider registered with vendor ID: custom-local-model-provider');
 }
 
 /**

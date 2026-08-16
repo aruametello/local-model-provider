@@ -1,5 +1,6 @@
 # Extension specific files
 *.vsix
+!install_build/*.vsix
 .DS_Store
 
 # Logs

@@ -1,8 +1,8 @@
 {
-  "name": "local-model-provider",
-  "displayName": "Local Model Provider",
+  "name": "local-model-provider-custom",
+  "displayName": "(custom) Local Model Provider",
   "description": "VS Code extension to connect to local LLM inference servers (Ollama, llama.cpp, LocalAI, LM Studio, vLLM) via OpenAI API compatible endpoints.",
-  "version": "1.1.3",
+  "version": "1.2.1",
   "publisher": "krevas",
   "icon": "assets/local-model-provider.png",
   "private": true,
@@ -55,44 +55,44 @@
   "contributes": {
     "languageModelChatProviders": [
       {
-        "vendor": "local-model-provider",
-        "displayName": "Local Model Provider"
+        "vendor": "custom-local-model-provider",
+        "displayName": "(custom) Local Model Provider"
       }
     ],
     "commands": [
       {
-        "command": "local-model-provider.setApiKey",
+        "command": "local-model-provider-custom.setApiKey",
         "title": "Set API Key (Secure)",
-        "category": "Local Model Provider"
+        "category": "(custom) Local Model Provider"
       },
       {
-        "command": "local-model-provider.showStatus",
+        "command": "local-model-provider-custom.showStatus",
         "title": "Show Server Status",
-        "category": "Local Model Provider"
+        "category": "(custom) Local Model Provider"
       },
       {
-        "command": "local-model-provider.selectModel",
+        "command": "local-model-provider-custom.selectModel",
         "title": "View Models & Set Default",
-        "category": "Local Model Provider"
+        "category": "(custom) Local Model Provider"
       },
       {
-        "command": "local-model-provider.switchServer",
+        "command": "local-model-provider-custom.switchServer",
         "title": "Switch Server Preset",
-        "category": "Local Model Provider"
+        "category": "(custom) Local Model Provider"
       },
       {
-        "command": "local-model-provider.showStats",
+        "command": "local-model-provider-custom.showStats",
         "title": "View Usage Statistics",
-        "category": "Local Model Provider"
+        "category": "(custom) Local Model Provider"
       },
       {
-        "command": "local-model-provider.refreshModels",
+        "command": "local-model-provider-custom.refreshModels",
         "title": "Refresh Model Cache",
-        "category": "Local Model Provider"
+        "category": "(custom) Local Model Provider"
       }
     ],
     "configuration": {
-      "title": "Local Model Provider",
+      "title": "(custom) Local Model Provider",
       "properties": {
         "local.model.provider.serverUrl": {
           "type": "string",
@@ -165,40 +165,14 @@
         "local.model.provider.qwenFinalAnswerRetry": {
           "type": "boolean",
           "default": true,
-          "description": "When Qwen tool loop compatibility is enabled, run one internal no-tools final-answer retry if Qwen returns only reasoning after a tool result.",
+          "description": "When Qwen tool loop compatibility is enabled, run one internal no-tools final-answer retry if Qwen returns only reasoning after a tool result. (Superseded by 'finalAnswerRetry' for general use.)",
           "order": 9
         },
-        "local.model.provider.agentTemperature": {
-          "type": "number",
-          "default": 0,
-          "minimum": 0,
-          "maximum": 2,
-          "description": "Temperature for agent/tool calling mode (lower = more consistent tool call formatting). Set to 0.0 for best results with fine-tuned models.",
-          "order": 10
-        },
-        "local.model.provider.topP": {
-          "type": "number",
-          "default": 1,
-          "minimum": 0,
-          "maximum": 1,
-          "description": "Top-p (nucleus) sampling parameter. Lower values make output more focused.",
-          "order": 11
-        },
-        "local.model.provider.frequencyPenalty": {
-          "type": "number",
-          "default": 0,
-          "minimum": -2,
-          "maximum": 2,
-          "description": "Frequency penalty to reduce repetition of token sequences.",
-          "order": 12
-        },
-        "local.model.provider.presencePenalty": {
-          "type": "number",
-          "default": 0,
-          "minimum": -2,
-          "maximum": 2,
-          "description": "Presence penalty to encourage talking about new topics.",
-          "order": 13
+        "local.model.provider.finalAnswerRetry": {
+          "type": "boolean",
+          "default": true,
+          "description": "When the model returns reasoning but no final answer (common with thinking models on vision or long requests), automatically run one extra no-tools request asking for the final answer. Disable to avoid the extra round-trip.",
+          "order": 19
         },
         "local.model.provider.maxRetries": {
           "type": "number",
@@ -241,6 +215,21 @@
           ],
           "description": "Logging verbosity level for the output channel.",
           "order": 17
+        },
+        "local.model.provider.visionModels": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Model IDs (case-insensitive) that should be advertised as supporting image input. Models listed here always get the vision capability, even when server-side detection is unavailable.",
+          "order": 18
+        },
+        "local.model.provider.includeUsageInStream": {
+          "type": "boolean",
+          "default": true,
+          "description": "Request per-response token usage from the server (stream_options.include_usage) and report it to VS Code so the chat context-window meter shows real token counts. Disable if your inference server rejects this field.",
+          "order": 20
         }
       }
     }

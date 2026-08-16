@@ -3,6 +3,8 @@ import { randomBytes } from 'node:crypto';
 import {
   OpenAIChatCompletionRequest,
   OpenAIModelsResponse,
+  OpenAIUsage,
+  OllamaModelCapabilities,
   GatewayConfig
 } from './types';
 
@@ -96,6 +98,10 @@ interface ParsedChunk {
   };
   finishReason?: string;
   id?: string;
+  // Token usage reported by servers that support stream_options.include_usage.
+  // Note: this chunk typically arrives with an EMPTY choices array, so it must
+  // be captured independently of delta/message.
+  usage?: OpenAIUsage;
 }
 
 /**
@@ -237,6 +243,40 @@ export class GatewayClient {
         );
       }
       throw error;
+    }
+  }
+
+  /**
+   * Fetch per-model capabilities from Ollama's native /api/tags endpoint.
+   * Returns a map of model name -> capability list (e.g. ["vision", "tools"]).
+   * Resolves to an empty map for non-Ollama servers or on any failure, so
+   * callers can safely treat a missing entry as "unknown".
+   */
+  public async fetchOllamaCapabilities(): Promise<OllamaModelCapabilities> {
+    const url = `${this.config.serverUrl}/api/tags`;
+
+    try {
+      const response = await this.fetch(url, {
+        method: 'GET',
+        headers: this.getHeaders(),
+      });
+
+      if (!response.ok) {
+        return {};
+      }
+
+      const json = (await response.json()) as { models?: Array<{ name?: string; capabilities?: string[] }> };
+      const result: OllamaModelCapabilities = {};
+      for (const model of json.models ?? []) {
+        if (model.name) {
+          result[model.name] = model.capabilities ?? [];
+        }
+      }
+      return result;
+    } catch {
+      // Non-Ollama servers (vLLM, LM Studio, llama.cpp, ...) do not expose
+      // /api/tags — fall back to heuristic/override detection.
+      return {};
     }
   }
 
@@ -415,6 +455,7 @@ export class GatewayClient {
         message: parsed.choices?.[0]?.message,
         finishReason: parsed.choices?.[0]?.finish_reason,
         id: parsed.id,
+        usage: parsed.usage,
       };
     } catch {
       console.error('Failed to parse SSE chunk:', data);
@@ -428,7 +469,7 @@ export class GatewayClient {
   private processSSELine(
     line: string,
     state: ToolCallState
-  ): { content: string; reasoning_content?: string; tool_calls: StreamingToolCall[]; finished_tool_calls: StreamingToolCall[] } | null {
+  ): { content: string; reasoning_content?: string; tool_calls: StreamingToolCall[]; finished_tool_calls: StreamingToolCall[]; finish_reason?: string; usage?: OpenAIUsage } | null {
     const trimmed = line.trim();
 
     if (trimmed === '' || trimmed === 'data: [DONE]') {
@@ -445,12 +486,18 @@ export class GatewayClient {
 
     if (parsed.delta) {
       const { content, reasoning_content, finishedToolCalls } = this.processDeltaFormat(parsed, state);
-      return { content, reasoning_content, tool_calls: [], finished_tool_calls: finishedToolCalls };
+      return { content, reasoning_content, tool_calls: [], finished_tool_calls: finishedToolCalls, finish_reason: parsed.finishReason, usage: parsed.usage };
     }
 
     if (parsed.message) {
       const { content, reasoning_content, finishedToolCalls } = this.processMessageFormat(parsed, state);
-      return { content, reasoning_content, tool_calls: [], finished_tool_calls: finishedToolCalls };
+      return { content, reasoning_content, tool_calls: [], finished_tool_calls: finishedToolCalls, finish_reason: parsed.finishReason, usage: parsed.usage };
+    }
+
+    // Usage-only chunk (stream_options.include_usage): the server sends a final
+    // chunk with an EMPTY `choices` array carrying the `usage` object.
+    if (parsed.usage) {
+      return { content: '', tool_calls: [], finished_tool_calls: [], usage: parsed.usage };
     }
 
     return null;
@@ -485,15 +532,23 @@ export class GatewayClient {
   public async *streamChatCompletion(
     request: OpenAIChatCompletionRequest,
     cancellationToken: vscode.CancellationToken
-  ): AsyncGenerator<{ content: string; reasoning_content?: string; tool_calls: StreamingToolCall[]; finished_tool_calls: StreamingToolCall[] }, void, unknown> {
+  ): AsyncGenerator<{ content: string; reasoning_content?: string; tool_calls: StreamingToolCall[]; finished_tool_calls: StreamingToolCall[]; finish_reason?: string; usage?: OpenAIUsage }, void, unknown> {
     const url = `${this.config.serverUrl}/v1/chat/completions`;
     const state = this.createToolCallState();
 
     try {
+      // Request per-response token usage (OpenAI/llama.cpp/vLLM support this via
+      // stream_options; the final chunk carries a `usage` object). Disabled by
+      // setting for servers that reject unknown fields.
+      const body: Record<string, unknown> = { ...request, stream: true };
+      if (this.config.includeUsageInStream) {
+        body.stream_options = { include_usage: true };
+      }
+
       const response = await this.fetchWithRetry(url, {
         method: 'POST',
         headers: { ...this.getHeaders(), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...request, stream: true }),
+        body: JSON.stringify(body),
       }, 'Chat completion');
 
       if (!response.ok) {
