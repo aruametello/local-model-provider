@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.2.8
+
+### New Features
+- **Configurable max generated tokens.** New `local.model.provider.maxOutputTokens` setting (default `65536` / 64k) caps how many tokens the extension requests per generation (`max_tokens`). It is still bounded by the model's context window and the space left after the input, so it cannot overflow. Raise it to allow longer generations on large-context models, or lower it to keep responses short.
+
+## 1.2.7
+
+### Bug Fixes
+- **Long generations are no longer cut short at a hardcoded 4096 tokens.** `calculateSafeMaxOutputTokens` capped `max_tokens` at the fixed `DEFAULT_OUTPUT_BUDGET` (4096) on every request, so on a 32k-context model a long answer stopped at 4096 tokens with `finish_reason="length"` — and the diagnostic then misleadingly blamed the upstream server's output limit. The output budget now scales with the model's context window (up to half the window), matching the documented intent that the server's own max-output limit is authoritative. `splitContextWindow` and `retryQwenFinalAnswer` were updated to match.
+
+## 1.2.6
+
+### Bug Fixes
+- **Vision requests no longer collapse `max_tokens` to ~64.** The final (post-truncation) token estimate now uses `extractEstimableText()` instead of inline `JSON.stringify`, so image parts are normalized to a fixed placeholder and their base64 payloads no longer inflate the estimate.
+- **Retries now fire for real network errors (`fetch failed`).** `isRetryableError` walks the `error.cause` chain and checks `error.code`, so Node's `TypeError: fetch failed` (with `ECONNREFUSED`/`ETIMEDOUT`/`ECONNRESET` nested in `cause`) is retried instead of failing instantly.
+- **Context truncation no longer breaks tool-call / tool-result pairing.** `truncateMessagesToFit` prunes orphaned messages (`pruneOrphanedToolMessages`) so every retained `role:"tool"` message has a matching retained assistant `tool_calls` entry and vice versa — OpenAI-compatible servers (vLLM, llama.cpp) reject orphans with HTTP 400.
+- **Stale diagnostic no longer references the removed setting.** The `finish_reason="length"` hint now directs users to raise the upstream server's output limit instead of the removed "Default Max Output Tokens" setting.
+- **`max_tokens` no longer overflows a near-full context window.** When the input estimate fills the window, `calculateSafeMaxOutputTokens` returns `undefined` and the request omits `max_tokens` entirely (server picks its ceiling) instead of forcing a 64-token floor that could still overflow. `reservedForInput` is clamped to a sane minimum so truncation always has a meaningful budget.
+- **Mid-stream stall protection.** Each stream read is now raced against `requestTimeout` (`readWithIdleTimeout`); a server that stops sending data after the first byte is aborted with a retryable error instead of hanging forever.
+- **Removed dead duplicate code.** Deleted the never-called `convertMessages()` / `streamChatCompletion()` helpers in `provider.ts` and the unused `ToolCallState.handleSSEError` in `client.ts`.
+- **System messages are now sent as `role:"system"`.** `mapRole` maps a system role (duck-typed for older type defs) to `'system'` instead of collapsing it into `'user'`.
+- **Cancellations are matched precisely.** `handleChatError` only swallows errors whose message *ends with* "cancelled" (the exact `GatewayError` produced by the cancellation paths), so genuine upstream failures containing that word are no longer hidden.
+- **Final-answer retry budgets context.** `retryQwenFinalAnswer` truncates the appended reasoning transcript to fit the remaining context window, so long conversations don't overflow with HTTP 400.
+
 ## 1.2.5
 
 ### Removed

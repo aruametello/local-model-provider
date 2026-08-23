@@ -2,7 +2,7 @@
   "name": "local-model-provider-custom",
   "displayName": "(custom) Local Model Provider",
   "description": "VS Code extension to connect to local LLM inference servers (Ollama, llama.cpp, LocalAI, LM Studio, vLLM) via OpenAI API compatible endpoints.",
-  "version": "1.2.5",
+  "version": "1.2.8",
   "publisher": "krevas",
   "icon": "assets/local-model-provider.png",
   "private": true,
@@ -218,6 +218,13 @@
           "default": true,
           "description": "Request per-response token usage from the server (stream_options.include_usage) and report it to VS Code so the chat context-window meter shows real token counts. Disable if your inference server rejects this field.",
           "order": 20
+        },
+        "local.model.provider.maxOutputTokens": {
+          "type": "number",
+          "default": 65536,
+          "minimum": 64,
+          "description": "Maximum number of tokens the extension will request per generation (max_tokens). Defaults to 65536 (64k). The value is still bounded by the model's context window and the space left after the input, so it cannot overflow. Raise it to allow longer generations on large-context models.",
+          "order": 21
         }
       }
     }

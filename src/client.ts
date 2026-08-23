@@ -61,9 +61,6 @@ interface ToolCallState {
   finalizedIndices: Set<number>;
   requestId: string;
   toolCallCounter: number;
-
-  // Add error handling for SSE events
-  handleSSEError(error: Error): void;
 }
 
 /**
@@ -140,13 +137,21 @@ export class GatewayClient {
     if (statusCode && this.retryConfig.retryableStatusCodes.includes(statusCode)) {
       return true;
     }
-    if (error instanceof Error) {
-      const message = error.message.toLowerCase();
-      return message.includes('timeout') ||
-             message.includes('econnreset') ||
-             message.includes('econnrefused') ||
-             message.includes('network') ||
-             message.includes('abort');
+    // Node's fetch surfaces connection failures as `TypeError: fetch failed`
+    // with the real error (ECONNREFUSED, timeout, ECONNRESET) nested in the
+    // `cause` property. Walk the cause chain and also check `error.code` so a
+    // stopped local server is retried instead of failing instantly.
+    let current: unknown = error;
+    while (current instanceof Error) {
+      const message = current.message.toLowerCase();
+      const code = (current as { code?: string }).code?.toLowerCase() ?? '';
+      if (message.includes('timeout') || message.includes('econnreset') ||
+          message.includes('econnrefused') || message.includes('network') ||
+          message.includes('abort') || code === 'econnrefused' ||
+          code === 'econnreset' || code === 'etimedout' || code === 'aborted') {
+        return true;
+      }
+      current = (current as { cause?: unknown }).cause;
     }
     return false;
   }
@@ -373,9 +378,6 @@ export class GatewayClient {
       finalizedIndices: new Set<number>(),
       requestId: `req_${Date.now()}_${randomBytes(4).toString('hex')}`,
       toolCallCounter: 0,
-      handleSSEError: (error: Error) => {
-        console.error('[LLM Gateway] SSE stream error:', error);
-      },
     };
   }
 
@@ -661,13 +663,22 @@ export class GatewayClient {
           break;
         }
 
+        // Idle/read timeout: `requestTimeout` is only enforced by the fetch()
+        // wrapper, which clears its timer once headers arrive. A server that
+        // stalls AFTER the first byte would otherwise hang forever. Race each
+        // read against a timer so a silent stream is aborted and surfaced as a
+        // retryable error.
         let readResult: ReadableStreamReadResult<Uint8Array>;
         try {
-          readResult = await reader.read();
+          readResult = await this.readWithIdleTimeout(reader, cancellationToken);
         } catch (readError) {
+          // A user cancellation aborts the reader; surface it cleanly.
+          if (cancellationToken.isCancellationRequested) {
+            throw new GatewayError('Chat completion cancelled', undefined, false);
+          }
           // If we already received data, treat stream termination as end-of-stream
           // Some servers (e.g. LM Studio) close the connection without sending [DONE]
-          if (receivedAnyData) {
+          if (receivedAnyData && !(readError instanceof GatewayError)) {
             console.warn('[LLM Gateway] Stream read interrupted after receiving data, treating as end-of-stream:', readError);
             break;
           }
@@ -790,6 +801,50 @@ export class GatewayClient {
       return response;
     } finally {
       clearTimeout(timeoutId);
+      cancelDisposable?.dispose();
+    }
+  }
+
+  /**
+   * Read a chunk from a stream reader, aborting if no data arrives within
+   * `requestTimeout`. Guards against servers that stall mid-stream (after the
+   * response headers have already been received, so the fetch() timeout no
+   * longer applies). A user cancellation aborts the reader immediately.
+   */
+  private async readWithIdleTimeout(
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    cancellationToken: vscode.CancellationToken
+  ): Promise<ReadableStreamReadResult<Uint8Array>> {
+    const controller = new AbortController();
+    const cancelDisposable = cancellationToken?.onCancellationRequested(() => {
+      controller.abort();
+      void reader.cancel();
+    });
+
+    try {
+      return await new Promise<ReadableStreamReadResult<Uint8Array>>((resolve, reject) => {
+        const timeoutId = setTimeout(() => {
+          controller.abort();
+          void reader.cancel();
+          reject(new GatewayError(
+            `Chat completion stream timed out after ${this.config.requestTimeout}ms with no data`,
+            undefined,
+            true
+          ));
+        }, this.config.requestTimeout);
+
+        reader.read().then(
+          (result) => {
+            clearTimeout(timeoutId);
+            resolve(result);
+          },
+          (err) => {
+            clearTimeout(timeoutId);
+            reject(err);
+          }
+        );
+      });
+    } finally {
       cancelDisposable?.dispose();
     }
   }

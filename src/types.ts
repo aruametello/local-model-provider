@@ -126,4 +126,6 @@ export interface GatewayConfig {
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   // Model ids (case-insensitive) that should be advertised as supporting image input
   visionModels: string[];
+  // Maximum tokens to request per generation (max_tokens). Defaults to 65536 (64k).
+  maxOutputTokens: number;
 }

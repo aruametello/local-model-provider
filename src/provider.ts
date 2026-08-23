@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { GatewayClient } from './client';
+import { GatewayClient, GatewayError } from './client';
 import { GatewayConfig, OpenAIChatCompletionRequest, OpenAIUsage, OllamaModelCapabilities } from './types';
 import { SecretManager } from './secrets';
 import { StatisticsManager } from './statistics';
@@ -11,11 +11,12 @@ import { parseQwenXmlToolCalls } from './qwenXml';
 // a context size at all. We deliberately do NOT expose them as settings — the
 // upstream server is the source of truth for both context and output limits.
 const FALLBACK_CONTEXT_WINDOW = 32768;
-// Default share of the context window reserved for output when splitting a
-// shared window into VS Code's maxInputTokens + maxOutputTokens. The output
-// budget is still capped at half the window; the server's own max-output limit
-// remains authoritative for actual generation length.
-const DEFAULT_OUTPUT_BUDGET = 4096;
+// Default cap on max_tokens sent per generation when the user has not set the
+// `maxOutputTokens` setting. The actual max_tokens sent to the server is
+// bounded by this value and the model's context window. The server's own
+// max-output limit remains authoritative for how long the model may actually
+// generate.
+const DEFAULT_MAX_OUTPUT_TOKENS = 65536;
 
 /**
  * Language model provider for OpenAI-compatible inference APIs
@@ -178,6 +179,13 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     if (role === vscode.LanguageModelChatMessageRole.Assistant) {
       return 'assistant';
     }
+    // The pinned @types/vscode may not expose a System enum value, so guard the
+    // check with a duck-typed lookup. If the runtime provides a system role,
+    // send it as 'system' rather than collapsing it into 'user'.
+    const systemRole = (vscode.LanguageModelChatMessageRole as { System?: number }).System;
+    if (systemRole !== undefined && role === systemRole) {
+      return 'system';
+    }
     return 'user';
   }
 
@@ -207,54 +215,6 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         arguments: JSON.stringify(part.input),
       },
     };
-  }
-
-  // Helper method: convertMessages (kept for potential future use)
-  private convertMessages(messages: readonly vscode.LanguageModelChatMessage[]): Record<string, unknown>[] {
-    const openAIMessages: Record<string, unknown>[] = [];
-
-    for (const msg of messages) {
-      const role = this.mapRole(msg.role);
-      const toolResults: Record<string, unknown>[] = [];
-      const toolCalls: Record<string, unknown>[] = [];
-      const imageParts: Record<string, unknown>[] = [];
-      let textContent = '';
-
-      for (const part of msg.content) {
-        if (part instanceof vscode.LanguageModelTextPart) {
-          textContent += part.value;
-        } else if (part instanceof vscode.LanguageModelToolResultPart) {
-          toolResults.push(this.convertToolResultPart(part));
-        } else if (part instanceof vscode.LanguageModelToolCallPart) {
-          toolCalls.push(this.convertToolCallPart(part));
-        } else {
-          const imagePart = this.extractImageContentPart(part);
-          if (imagePart) {
-            imageParts.push(imagePart);
-          }
-        }
-      }
-
-      if (toolCalls.length > 0) {
-        const preservedReasoning = this.config.qwenToolLoopCompat ? this.getPreservedReasoningForToolCalls(toolCalls) : '';
-        const assistantContent = preservedReasoning
-          ? `${preservedReasoning}${textContent ? `\n\n${textContent}` : ''}`
-          : textContent || null;
-        openAIMessages.push({ role: 'assistant', content: assistantContent, tool_calls: toolCalls });
-      } else if (toolResults.length > 0) {
-        openAIMessages.push(...toolResults);
-      } else if (imageParts.length > 0 || textContent) {
-        const content: unknown = imageParts.length > 0
-          ? [
-              ...(textContent ? [{ type: 'text', text: textContent }] : []),
-              ...imageParts,
-            ]
-          : textContent;
-        openAIMessages.push({ role, content });
-      }
-    }
-
-    return openAIMessages;
   }
 
   /**
@@ -444,7 +404,65 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     // Combine first message with recent messages
     result.push(...recentMessages);
 
-    this.outputChannel.appendLine(`Truncated: kept ${result.length}/${messages.length} messages, ~${usedTokens} tokens`);
+    // Prune orphaned tool-call / tool-result messages. Truncation can drop an
+    // assistant tool_calls message while keeping its tool result (or vice
+    // versa); OpenAI-compatible servers (vLLM, llama.cpp) reject that with
+    // HTTP 400. Tool loops are exactly when overflow happens most.
+    const pruned = this.pruneOrphanedToolMessages(result);
+
+    this.outputChannel.appendLine(`Truncated: kept ${pruned.length}/${messages.length} messages, ~${usedTokens} tokens`);
+
+    return pruned;
+  }
+
+  /**
+   * Remove tool messages whose parent assistant tool_calls were dropped, and
+   * assistant tool_calls whose tool results were dropped. Keeps the message
+   * list valid for OpenAI-compatible servers.
+   */
+  private pruneOrphanedToolMessages(messages: any[]): any[] {
+    // Collect the set of tool_call_ids that have a retained tool result.
+    const retainedToolResultIds = new Set<string>();
+    for (const msg of messages) {
+      if (msg?.role === 'tool' && typeof msg.tool_call_id === 'string') {
+        retainedToolResultIds.add(msg.tool_call_id);
+      }
+    }
+
+    // Collect the set of tool_call_ids referenced by retained assistant messages.
+    const retainedToolCallIds = new Set<string>();
+    for (const msg of messages) {
+      if (msg?.role === 'assistant' && Array.isArray(msg.tool_calls)) {
+        for (const tc of msg.tool_calls) {
+          if (tc && typeof tc.id === 'string') {
+            retainedToolCallIds.add(tc.id);
+          }
+        }
+      }
+    }
+
+    const result: any[] = [];
+    for (const msg of messages) {
+      if (msg?.role === 'tool') {
+        // Drop a tool result whose parent assistant tool_calls was dropped.
+        if (typeof msg.tool_call_id === 'string' && !retainedToolCallIds.has(msg.tool_call_id)) {
+          continue;
+        }
+        result.push(msg);
+      } else if (msg?.role === 'assistant' && Array.isArray(msg.tool_calls)) {
+        // Keep only the tool_calls whose results were retained.
+        const keptCalls = msg.tool_calls.filter(
+          (tc: any) => !tc || typeof tc.id !== 'string' || retainedToolResultIds.has(tc.id)
+        );
+        if (keptCalls.length === 0 && !msg.content) {
+          // No retained results and no content — the whole message is orphaned.
+          continue;
+        }
+        result.push({ ...msg, tool_calls: keptCalls });
+      } else {
+        result.push(msg);
+      }
+    }
 
     return result;
   }
@@ -515,55 +533,6 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       this.outputChannel.appendLine(`Repaired attempt: ${repaired}`);
       return null;
     }
-  }
-
-  // Helper method: streamChatCompletion (updated for new client interface)
-  private async streamChatCompletion(
-    requestOptions: any,
-    progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-    token: vscode.CancellationToken
-  ): Promise<void> {
-    this.outputChannel.appendLine(`Streaming chat completion...`);
-    let totalContent = '';
-    let totalToolCalls = 0;
-
-    for await (const chunk of this.client.streamChatCompletion(requestOptions, token)) {
-      if (token.isCancellationRequested) {
-        break;
-      }
-
-      // Report text content immediately
-      if (chunk.content) {
-        totalContent += chunk.content;
-        progress.report(new vscode.LanguageModelTextPart(chunk.content));
-      }
-
-      // Process finished tool calls (fully accumulated by client)
-      if (chunk.finished_tool_calls && chunk.finished_tool_calls.length > 0) {
-        for (const toolCall of chunk.finished_tool_calls) {
-          totalToolCalls++;
-          this.outputChannel.appendLine(`Tool call received: id=${toolCall.id}, name=${toolCall.name}`);
-          this.outputChannel.appendLine(`  Raw arguments: ${toolCall.arguments.substring(0, 500)}${toolCall.arguments.length > 500 ? '...' : ''}`);
-
-          // Parse arguments with repair capability
-          let args = this.tryRepairJson(toolCall.arguments) as Record<string, unknown> | null;
-
-          if (args === null) {
-            this.log('error', ` Failed to parse tool call arguments for ${toolCall.name}`);
-            this.outputChannel.appendLine(`  Full arguments: ${toolCall.arguments}`);
-            args = {}; // Fallback to empty args
-          }
-
-          progress.report(new vscode.LanguageModelToolCallPart(
-            toolCall.id,
-            toolCall.name,
-            args as object
-          ));
-        }
-      }
-    }
-
-    this.outputChannel.appendLine(`Completed chat request, received ${totalContent.length} characters, ${totalToolCalls} tool calls`);
   }
 
   /**
@@ -841,11 +810,13 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
    */
   private splitContextWindow(contextWindow: number): { maxInputTokens: number; maxOutputTokens: number } {
     const windowSize = Math.max(128, contextWindow);
-    const desiredOutput = Math.max(64, DEFAULT_OUTPUT_BUDGET);
-    // Cap output at half the window so a large output budget cannot starve the
-    // input side — e.g. a 256k output preference on a 256k model would otherwise
-    // leave ~1 input token. The server's own max-output limit remains authoritative
-    // for how long the model may actually generate.
+    // Reserve up to the configured maxOutputTokens (default 64k) for output so
+    // long generations are not cut short at a fixed 4096 tokens. Capping at
+    // half the window keeps a large output budget from starving the input side
+    // — e.g. a 256k output preference on a 256k model would otherwise leave ~1
+    // input token. The server's own max-output limit remains authoritative for
+    // how long the model may actually generate.
+    const desiredOutput = Math.max(64, this.config.maxOutputTokens || DEFAULT_MAX_OUTPUT_TOKENS);
     const halfWindow = Math.max(64, Math.floor(windowSize / 2));
     const maxOutputTokens = Math.min(desiredOutput, halfWindow, windowSize - 64);
     const maxInputTokens = Math.max(64, windowSize - maxOutputTokens);
@@ -867,29 +838,46 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   /**
    * Calculate safe max output tokens based on input estimate.
    *
-   * The configured `defaultMaxOutputTokens` setting is gone — the upstream
-   * server's own max-output limit is authoritative. We only use a built-in
-   * DEFAULT_OUTPUT_BUDGET as a safety cap so a single request can never consume
-   * the whole shared context window, then clamp to the space actually left for
-   * output after the estimated input + a small buffer. Omitting `max_tokens`
-   * entirely lets the server pick its own ceiling.
+   * The upstream server's own max-output limit is authoritative for how long
+   * the model may actually generate. We cap output at the configurable
+   * `maxOutputTokens` setting (default 64k) and at half the shared context
+   * window so a single request can never consume the whole window, then clamp
+   * to the space actually left for output after the estimated input + a small
+   * buffer. Omitting `max_tokens` entirely lets the server pick its own ceiling.
    */
   private calculateSafeMaxOutputTokens(
     estimatedInputTokens: number,
     toolsOverhead: number,
     modelMaxContext: number
-  ): number {
+  ): number | undefined {
     const totalEstimatedTokens = estimatedInputTokens + toolsOverhead;
     const conservativeInputEstimate = Math.ceil(totalEstimatedTokens * 1.2);
     const bufferTokens = 256;
-    const budgetCap = DEFAULT_OUTPUT_BUDGET;
+    // Cap output at the configured maxOutputTokens (default 64k) and at half
+    // the shared context window so a single request can never consume the whole
+    // window and starve the input side. The server's own max-output limit
+    // remains authoritative for how long the model may actually generate.
+    const budgetCap = Math.max(
+      64,
+      Math.min(
+        this.config.maxOutputTokens || DEFAULT_MAX_OUTPUT_TOKENS,
+        Math.floor(modelMaxContext / 2)
+      )
+    );
 
     const safeMaxOutputTokens = Math.min(
       budgetCap,
       Math.floor(modelMaxContext - conservativeInputEstimate - bufferTokens)
     );
 
-    return Math.max(64, safeMaxOutputTokens);
+    // When the input (plus buffer) already fills the window, do NOT force a
+    // minimum of 64 — that could still overflow and trigger an HTTP 400.
+    // Omit max_tokens entirely so the server picks its own ceiling.
+    if (safeMaxOutputTokens <= 0) {
+      return undefined;
+    }
+
+    return safeMaxOutputTokens;
   }
 
   /**
@@ -1037,11 +1025,32 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     baseRequestOptions: Record<string, unknown>,
     messages: Record<string, unknown>[],
     reasoningContent: string,
+    modelMaxContext: number,
     progress: vscode.Progress<vscode.LanguageModelResponsePart>,
     token: vscode.CancellationToken
   ): Promise<boolean> {
     const finalMessages = [...messages];
     if (reasoningContent.trim()) {
+      // Budget the appended reasoning transcript so a long conversation does
+      // not overflow the context window (which would trigger an HTTP 400).
+      // Reserve a share of the window for the appended reasoning + the final
+      // answer, and truncate the reasoning to fit.
+      const existingTokens = finalMessages.reduce(
+        (sum, m) => sum + this.estimateMessageTokens(m),
+        0
+      );
+      const reasoningBudget = Math.max(
+        0,
+        modelMaxContext - existingTokens - (this.config.maxOutputTokens || DEFAULT_MAX_OUTPUT_TOKENS) - 256
+      );
+      const reasoningChars = reasoningContent.trim();
+      // ~4 chars per token; keep a small margin.
+      const maxReasoningChars = reasoningBudget * 4;
+      const trimmedReasoning = reasoningChars.length > maxReasoningChars
+        ? reasoningChars.slice(0, maxReasoningChars)
+        : reasoningChars;
+      // Reassign so the push below uses the context-budgeted reasoning.
+      reasoningContent = trimmedReasoning;
       finalMessages.push({
         role: 'assistant',
         content: `<think>\n${reasoningContent.trim()}\n</think>`,
@@ -1055,7 +1064,10 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     const retryOptions: Record<string, unknown> = {
       ...baseRequestOptions,
       messages: finalMessages,
-      max_tokens: Math.min(Number(baseRequestOptions.max_tokens) || DEFAULT_OUTPUT_BUDGET, DEFAULT_OUTPUT_BUDGET),
+      // Reuse the base request's (config-capped, window-scaled) max_tokens
+      // rather than clamping to a fixed 4096, so the final-answer retry is not
+      // cut short on models with a larger output budget.
+      max_tokens: Number(baseRequestOptions.max_tokens) || this.config.maxOutputTokens || DEFAULT_MAX_OUTPUT_TOKENS,
     };
     delete retryOptions.tools;
     delete retryOptions.tool_choice;
@@ -1091,7 +1103,15 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     // A user-initiated cancellation is not an error: the request was aborted
     // (TCP connection torn down) so the upstream server stops generating.
     // Swallow it silently — no notification, no error log.
-    if (errorMessage.toLowerCase().includes('cancelled')) {
+    //
+    // Match precisely: the cancellation paths in client.ts throw a GatewayError
+    // whose message ends with "cancelled" (e.g. "Chat completion cancelled").
+    // A loose substring match could swallow a genuine upstream failure that
+    // merely contains the word "cancelled".
+    const isCancellation =
+      error instanceof GatewayError &&
+      /cancelled$/i.test(error.message.trim());
+    if (isCancellation) {
       this.log('info', 'Chat request cancelled by user.');
       throw error;
     }
@@ -1168,15 +1188,17 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     // Full shared context = maxInputTokens + maxOutputTokens (VS Code/BYOK convention).
     // Do NOT use maxInputTokens alone — that is only the input half of the split window.
     const modelMaxContext = this.getModelContextWindow(model);
-    // Removed the configurable `defaultMaxOutputTokens` setting: the server's own
-    // limit governs generation length. We only reserve a conservative share of
-    // the context window (capped at half) for output so truncation has room.
+    // The server's own limit governs generation length. We reserve a share of
+    // the context window for output (bounded by the configurable maxOutputTokens
+    // setting and half the window) so truncation has room.
     const desiredOutputTokens = Math.min(
-      model.maxOutputTokens || DEFAULT_OUTPUT_BUDGET,
+      model.maxOutputTokens || this.config.maxOutputTokens || DEFAULT_MAX_OUTPUT_TOKENS,
       Math.floor(modelMaxContext / 2)
     );
     const toolsTokenEstimate = options.tools ? Math.ceil(JSON.stringify(options.tools).length / 4 * 1.2) : 0;
-    const reservedForInput = modelMaxContext - desiredOutputTokens - toolsTokenEstimate - 256;
+    // Clamp the input budget to a sane minimum so truncation always has a
+    // meaningful window to work with, even when tool schemas are large.
+    const reservedForInput = Math.max(256, modelMaxContext - desiredOutputTokens - toolsTokenEstimate - 256);
 
     // Build input text for an initial token estimate using ALL messages.
     // Image parts are normalized to a fixed placeholder so base64 payloads
@@ -1197,13 +1219,12 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       }
     }
 
-    // Build input text for token estimation (final set used in request)
+    // Build input text for token estimation (final set used in request).
+    // Use extractEstimableText so image content parts are normalized to a fixed
+    // placeholder instead of their full base64 data URL — otherwise a single
+    // image would inflate the estimate and collapse max_tokens to the 64 floor.
     const inputText = truncatedMessages
-      .map((m) => {
-        let text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '');
-        if (m.tool_calls) { text += JSON.stringify(m.tool_calls); }
-        return text;
-      })
+      .map((m) => this.extractEstimableText(m))
       .join('\n');
 
     const toolsOverhead = options.tools ? Math.ceil(JSON.stringify(options.tools).length / 4) : 0;
@@ -1215,7 +1236,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     );
 
     this.log('debug',
-      `Token estimate: input=${estimatedInputTokens}, tools=${toolsOverhead}, model_context=${modelMaxContext}, chosen_max_tokens=${safeMaxOutputTokens}`
+      `Token estimate: input=${estimatedInputTokens}, tools=${toolsOverhead}, model_context=${modelMaxContext}, chosen_max_tokens=${safeMaxOutputTokens ?? 'omitted'}`
     );
 
     // Build request. Sampling parameters (temperature, top_p, frequency/presence
@@ -1224,8 +1245,12 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     const requestOptions: Record<string, unknown> = {
       model: model.id,
       messages: truncatedMessages,
-      max_tokens: safeMaxOutputTokens,
     };
+    // Omit max_tokens entirely when the input already fills the window, so the
+    // server picks its own ceiling instead of overflowing with a forced minimum.
+    if (safeMaxOutputTokens !== undefined) {
+      requestOptions.max_tokens = safeMaxOutputTokens;
+    }
 
     const toolsConfig = this.buildToolsConfig(options);
     if (toolsConfig) {
@@ -1378,14 +1403,14 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
           const hasToolResults = openAIMessages.some((message) => message.role === 'tool');
           if (this.config.finalAnswerRetry || (hasToolResults && this.config.qwenToolLoopCompat && this.config.qwenFinalAnswerRetry)) {
-            const retried = await this.retryQwenFinalAnswer(requestOptions, truncatedMessages, totalReasoningContent, progress, token);
+            const retried = await this.retryQwenFinalAnswer(requestOptions, truncatedMessages, totalReasoningContent, modelMaxContext, progress, token);
             if (retried) {
               return;
             }
           }
 
           const finishHint = lastFinishReason === 'length'
-            ? ' Generation stopped at the maximum output token limit — thinking models spend the whole budget reasoning before answering. Increase "Local Model Provider: Default Max Output Tokens" and try again.'
+            ? ' Generation stopped at the maximum output token limit — thinking models spend the whole budget reasoning before answering. Raise the upstream server\'s output limit (e.g. llama.cpp `-c`/`--ctx-size` or the server\'s max-tokens setting) and try again.'
             : '';
           const message = hasToolResults
             ? 'The tool call completed, but the model produced reasoning without a final summary. Check the tool result above for the completed action.'
@@ -1485,6 +1510,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       modelCacheTtlMs: config.get<number>('modelCacheTtlMs', 300000),
       logLevel: config.get<'debug' | 'info' | 'warn' | 'error'>('logLevel', 'info'),
       visionModels: config.get<string[]>('visionModels', []),
+      maxOutputTokens: config.get<number>('maxOutputTokens', DEFAULT_MAX_OUTPUT_TOKENS),
     };
 
     // Validate requestTimeout

@@ -54,7 +54,8 @@ capabilities (`toolCalling`, `imageInput`). Each model's context window comes fr
 server metadata (`GatewayClient.extractContextLength`, e.g. llama.cpp `status.args`),
 falling back to a built-in `FALLBACK_CONTEXT_WINDOW` constant (the `defaultMaxTokens`
 and `defaultMaxOutputTokens` settings were removed — the upstream server is the source
-of truth for context and output limits). When a chat request arrives,
+of truth for context and output limits; the configurable `maxOutputTokens` setting,
+default 65536/64k, caps how many tokens the extension requests per generation). When a chat request arrives,
 `provideLanguageModelChatResponse()` converts VS Code message parts → OpenAI-format
 messages (text, tools, tool results, **images as base64 `image_url` data URLs**),
 streams the completion back through `client.streamChatCompletion()`, and reports
@@ -66,7 +67,7 @@ streams the completion back through `client.streamChatCompletion()`, and reports
 |------|------|-------|
 | `src/extension.ts` | Activation, command registration (setApiKey, showStatus, selectModel, switchServer, showStats, refreshModels), status bar wiring | Commands call into `provider` / `statusBar` / `statsManager`. Preset switching updates config then calls `provider.applyLatestConfiguration()` + `clearModelCache()`. |
 | `src/provider.ts` | **Core.** `GatewayProvider implements vscode.LanguageModelChatProvider` | Message conversion, token estimation/truncation, tool-call handling (incl. JSON repair), Qwen XML tool-call compat, vision detection + image forwarding, reasoning salvage + final-answer retry, model caching. |
-| `src/client.ts` | `GatewayClient`: HTTP with retry/backoff/jitter, SSE streaming parser for `/v1/chat/completions`, `/v1/models` fetch, Ollama `/api/tags` capability probe | Yields chunks `{ content, reasoning_content?, tool_calls, finished_tool_calls, finish_reason?, usage? }`. Tool calls accumulate **by index** during streaming (ids may arrive late). Injects `stream_options: { include_usage: true }` when `includeUsageInStream` is set; the trailing usage chunk arrives with an **empty `choices` array**, so `parseSSEData` must capture `usage` independently of delta/message. `fetch`/`fetchWithRetry` accept a `CancellationToken` and abort the request on cancel (TCP teardown); `sleepCancellable` short-circuits retry backoff. **`extractContextLength(model)`** (static) parses a model's effective context window from llama.cpp `status.args` (`--override-kv ...context_length=int:<n>` wins over `--ctx-size <n>`); returns `undefined` when absent so callers fall back to a built-in `FALLBACK_CONTEXT_WINDOW` (no `defaultMaxTokens` setting anymore). |
+| `src/client.ts` | `GatewayClient`: HTTP with retry/backoff/jitter, SSE streaming parser for `/v1/chat/completions`, `/v1/models` fetch, Ollama `/api/tags` capability probe | Yields chunks `{ content, reasoning_content?, tool_calls, finished_tool_calls, finish_reason?, usage? }`. Tool calls accumulate **by index** during streaming (ids may arrive late). Injects `stream_options: { include_usage: true }` when `includeUsageInStream` is set; the trailing usage chunk arrives with an **empty `choices` array**, so `parseSSEData` must capture `usage` independently of delta/message. `fetch`/`fetchWithRetry` accept a `CancellationToken` and abort the request on cancel (TCP teardown); `sleepCancellable` short-circuits retry backoff. **`isRetryableError` walks the `error.cause` chain and checks `error.code`** so Node's `TypeError: fetch failed` (with `ECONNREFUSED`/`ETIMEDOUT`/`ECONNRESET` nested in `cause`) is retried. **`readWithIdleTimeout`** races each stream read against `requestTimeout` so a server that stalls mid-stream (after headers) is aborted with a retryable `GatewayError` instead of hanging. **`extractContextLength(model)`** (static) parses a model's effective context window from llama.cpp `status.args` (`--override-kv ...context_length=int:<n>` wins over `--ctx-size <n>`); returns `undefined` when absent so callers fall back to a built-in `FALLBACK_CONTEXT_WINDOW` (no `defaultMaxTokens` setting anymore). |
 | `src/types.ts` | All shared interfaces: `OpenAIModel`, `OpenAIMessage`, request/response/chunk types, `OllamaModelCapabilities`, `GatewayConfig` | Keep in sync with what `client.ts` sends/reads and what `loadConfig()` fills. `OpenAIModel` carries optional `status.args` (llama.cpp launch args) and `contextLength` (parsed effective context window). |
 | `src/secrets.ts` | `SecretManager`: API key in `vscode.SecretStorage` (key: `local.model.provider.apiKey`), legacy settings migration | Never log the key. |
 | `src/statusBar.ts` | Status bar item (`$(plug)/$(check)/$(error)` "Local LLM"), quick-pick status menu, server presets UI types (`ServerPreset`, `ServerStatus`) | |
@@ -93,18 +94,29 @@ provideLanguageModelChatResponse(model, messages, options, progress, token)
  │    = model.maxInputTokens + model.maxOutputTokens (split from extractContextLength
  │    / built-in FALLBACK_CONTEXT_WINDOW via splitContextWindow;
  │    VS Code UI shows that same sum — do NOT put full n_ctx in maxInput alone)
- │    max_tokens is derived from the window; the server's own output limit governs length
+ │    max_tokens is derived from the window and the configurable `maxOutputTokens`
+ │    setting (default 64k); the server's own output limit governs length
+ ├─ reservedForInput is clamped to a sane minimum (Math.max(256, …)) so truncation
+ │    always has a meaningful budget even with large tool schemas
  ├─ truncateMessagesToFit if estimate > reserved input space
- ├─ build requestOptions { model, messages, max_tokens[, tools…] }
+ │    - keeps message 0 (system) + most recent messages, then prunes orphaned
+ │      tool-call/tool-result pairs (pruneOrphanedToolMessages) so the message list
+ │      stays valid for OpenAI-compatible servers (vLLM/llama.cpp reject orphans)
+ ├─ build requestOptions { model, messages[, max_tokens][, tools…] }
  │    - NO sampling params are ever sent (temperature/top_p/penalties removed in 1.2.1) —
  │      the upstream server's own defaults apply; do NOT re-add them
+ │    - max_tokens is OMITTED entirely when the input already fills the window
+ │      (calculateSafeMaxOutputTokens returns undefined instead of forcing 64)
  │    - parallel_tool_calls only when enabled
  │    - client injects stream_options.include_usage when includeUsageInStream is set
  ├─ stream via client.streamChatCompletion()
  │    - cancellationToken is wired into an AbortController (client.fetch) so a
  │      user cancel tears down the TCP connection immediately; retry backoff is
  │      also cancellable (sleepCancellable). Cancellation surfaces as a
- │      "…cancelled" GatewayError, which handleChatError swallows silently.
+ │      GatewayError whose message ends with "cancelled", which handleChatError
+ │      swallows silently (exact match, not a loose substring).
+ │    - each stream read is raced against requestTimeout (readWithIdleTimeout) so a
+ │      mid-stream stall aborts with a retryable error instead of hanging
  │    reasoning_content → ThinkingPart (duck-typed class) or  tags fallback
  │    content           → TextPart (with Qwen XML tool-call buffering if enabled)
  │    finished_tool_calls → JSON-repair args, fill missing required props, ToolCallPart
@@ -117,7 +129,10 @@ provideLanguageModelChatResponse(model, messages, options, progress, token)
  │    if no content & no tools:
  │       1) salvage answer after last </thinking>/</think> in reasoning (extractAnswerFromReasoning)
  │       2) else finalAnswerRetry (or legacy qwen gate): one no-tools "give the final answer" request
- │       3) else fallback message; finish_reason==="length" hints to raise defaultMaxOutputTokens
+ │          (retryQwenFinalAnswer budgets the appended reasoning against the context
+ │          window so long conversations don't overflow)
+ │       3) else fallback message; finish_reason==="length" hints to raise the
+ │          upstream server's output limit (not a removed setting)
  └─ record stats, log response time
 ```
 
@@ -179,6 +194,10 @@ code --install-extension .\local-model-provider-custom-<version>.vsix   # instal
 4. **Refresh the portable installer:** copy the new vsix into `install_build/`
    (replacing the old one) and, if the version changed, update the `VSIX=` line
    at the top of `install_build/install.bat` to match the new filename.
+   (`install_build/README.md` is intentionally version-agnostic — no edit needed.)
+   Repackage **after** updating these files so the copy of `install_build/`
+   embedded in the vsix itself is current, then re-copy the fresh vsix back
+   into `install_build/`.
 5. User must **Developer: Reload Window** for it to take effect.
 
 Notes:
@@ -210,13 +229,23 @@ Notes:
 - **VS Code displays context as `maxInputTokens + maxOutputTokens` (1.2.4+).** Never set
   `maxInputTokens` to the full window *and* a separate full `maxOutputTokens` — that double-counts
   and inflates the picker (e.g. 256k+256k → "512K"). Split the built-in `FALLBACK_CONTEXT_WINDOW`
-  constant via `splitContextWindow()` (output = min(DEFAULT_OUTPUT_BUDGET, half window); input = remainder)
+  constant via `splitContextWindow()` (output = half the window; input = remainder)
   so the two fields sum back to the real context. The `defaultMaxTokens`/`defaultMaxOutputTokens`
   settings are removed — the server is the source of truth. Request budgeting recovers the full
   window with `getModelContextWindow()` (`maxInput + maxOutput`), not `maxInputTokens` alone.
   Non-llama.cpp servers don't report context → falls back to the built-in `FALLBACK_CONTEXT_WINDOW`.
 - **Streaming tool-call ids arrive late.** Accumulate by `index`, not id; finalize with
   generated ids at stream end (`getRemainingToolCalls`).
+- **`mapRole` maps System → `'system'`** (guarded by a duck-typed enum lookup, since the
+  pinned `@types/vscode` may not expose a `System` value). Do not collapse system prompts
+  into `user` — local models handle them inconsistently.
+- **`handleChatError` swallows cancellations by exact match** — a `GatewayError` whose
+  message *ends with* "cancelled" (the `client.ts` cancellation paths). Do not revert to a
+  loose substring match, which would hide genuine upstream failures containing that word.
+- **Vision requests must never count base64 in the token estimate.** Both the initial and
+  the final (post-truncation) estimates use `extractEstimableText()`; an inline
+  `JSON.stringify(m.content)` on multimodal content would inflate the estimate and collapse
+  `max_tokens` to the 64 floor.
 - **`qwenXml.ts` must stay vscode-free** or the standalone test compile breaks.
 - **Extension id is `krevas.local-model-provider-custom` (1.2.0+), NOT the official
   `krevas.local-model-provider`.** The fork deliberately coexists with the marketplace
@@ -228,10 +257,11 @@ Notes:
 
 - [ ] Code change compiles: `npx tsc -p ./ --noEmit` → exit 0
 - [ ] Tests pass: `npm test`
-- [ ] New/changed setting? → `package.json` + `GatewayConfig` + `loadConfig()` (3 places). Never reintroduce the removed `defaultMaxTokens`/`defaultMaxOutputTokens` settings — use the `FALLBACK_CONTEXT_WINDOW`/`DEFAULT_OUTPUT_BUDGET` constants in `provider.ts`
+- [ ] New/changed setting? → `package.json` + `GatewayConfig` + `loadConfig()` (3 places). Never reintroduce the removed `defaultMaxTokens`/`defaultMaxOutputTokens` settings — use the `FALLBACK_CONTEXT_WINDOW`/`DEFAULT_MAX_OUTPUT_TOKENS` constants and the `maxOutputTokens` setting in `provider.ts`
 - [ ] New server-side behavior? → extend `client.ts` (+ `types.ts`), keep retry/compat rules
 - [ ] Model capability change? → update `detectVision`; per-model `extractContextLength` + `splitContextWindow` (input+output must sum to real n_ctx); request path uses `getModelContextWindow()` not `maxInputTokens` alone
-- [ ] Context-window / token-budget change? → keep the per-model lookup (`model.maxInputTokens` from `GatewayClient.extractContextLength`); don't revert to a single global `defaultMaxTokens` setting
+- [ ] Context-window / token-budget change? → keep the per-model lookup (`model.maxInputTokens` from `GatewayClient.extractContextLength`); don't revert to a single global `defaultMaxTokens` setting. `calculateSafeMaxOutputTokens` returns `undefined` (omit `max_tokens`) when input fills the window — don't force a 64 floor. The output budget is bounded by the configurable `maxOutputTokens` setting (default 64k) and half of `modelMaxContext` — do not reintroduce a hard `DEFAULT_OUTPUT_BUDGET` cap on `max_tokens`, or long generations on large-context models get cut short at `finish_reason=length`.
+- [ ] Truncation change? → keep `pruneOrphanedToolMessages` so tool-call/tool-result pairs stay valid after dropping middle messages
 - [ ] Version bump + `CHANGELOG.md` entry
 - [ ] Rebuild + repackage + reinstall (`esbuild` → `package` → `code --install-extension`)
 - [ ] Portable installer refreshed: new vsix copied into `install_build/`, `VSIX=` line in `install.bat` matches the version

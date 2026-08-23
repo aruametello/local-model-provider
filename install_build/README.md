@@ -8,7 +8,7 @@ No Node.js, no internet access, and no VS Code Marketplace account required on t
 | File | Purpose |
 |------|---------|
 | `install.bat` | One-click installer (Windows) — finds your VS Code install and installs the bundled extension |
-| `local-model-provider-custom-1.2.2.vsix` | The prebuilt extension package |
+| `local-model-provider-custom-<version>.vsix` | The prebuilt extension package (the exact filename matches the current release, e.g. `1.2.6`) |
 
 ## How to use on another computer
 
