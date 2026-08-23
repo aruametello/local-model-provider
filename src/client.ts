@@ -144,7 +144,11 @@ export class GatewayClient {
     let current: unknown = error;
     while (current instanceof Error) {
       const message = current.message.toLowerCase();
-      const code = (current as { code?: string }).code?.toLowerCase() ?? '';
+      // `error.code` is not guaranteed to be a string — Node/undici and some
+      // servers attach numeric codes. Guard the type before calling
+      // `.toLowerCase()` so a non-string code can't crash the retry path.
+      const rawCode = (current as { code?: unknown }).code;
+      const code = typeof rawCode === 'string' ? rawCode.toLowerCase() : '';
       if (message.includes('timeout') || message.includes('econnreset') ||
           message.includes('econnrefused') || message.includes('network') ||
           message.includes('abort') || code === 'econnrefused' ||

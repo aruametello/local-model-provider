@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.11
+
+### Bug Fixes
+- **Retry path no longer crashes on non-string error codes.** `isRetryableError` assumed `error.code` was always a string and called `.toLowerCase()` on it directly. Node/undici and some servers attach *numeric* error codes, so after a long session a network error with a numeric `code` threw `n.code?.toLowerCase is not a function` inside `streamChatCompletion`'s retry path — surfacing as a wrapped `GatewayError` ("Chat completion request failed"). The code now type-guards the value (`typeof rawCode === 'string'`) before lowercasing, so non-string codes are safely ignored and retries still work for genuine string codes like `econnrefused`/`etimedout`.
+
 ## 1.2.10
 
 ### Removed
