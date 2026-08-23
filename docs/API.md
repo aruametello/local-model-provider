@@ -94,8 +94,6 @@ interface GatewayConfig {
   serverUrl: string;           // Inference server URL
   apiKey?: string;             // API key (from SecretStorage)
   requestTimeout: number;      // Request timeout in ms
-  defaultMaxTokens: number;    // Max input tokens (context window)
-  defaultMaxOutputTokens: number; // Max output tokens
   enableToolCalling: boolean;  // Enable function calling
   parallelToolCalling: boolean; // Allow parallel tool calls
   // NOTE: no sampling parameters (temperature/top_p/penalties) — the server's own defaults are used

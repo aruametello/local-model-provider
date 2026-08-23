@@ -10,6 +10,14 @@ export interface OpenAIModel {
   // Non-standard fields exposed by some servers (e.g. Ollama, LM Studio)
   capabilities?: string[];
   architecture?: { input_modalities?: string[] };
+  // llama.cpp exposes the per-model launch args (including --ctx-size and
+  // --override-kv ...context_length=...) under status.args. We parse the
+  // effective context window from these into `contextLength`.
+  status?: { args?: string[] };
+  // Effective context window (tokens) for this model, parsed from server
+  // metadata (llama.cpp status.args). When the server does not report one,
+  // the provider falls back to a built-in context window.
+  contextLength?: number;
 }
 
 /**
@@ -106,8 +114,6 @@ export interface GatewayConfig {
   serverUrl: string;
   apiKey?: string;
   requestTimeout: number;
-  defaultMaxTokens: number;
-  defaultMaxOutputTokens: number;
   enableToolCalling: boolean;
   parallelToolCalling: boolean;
   qwenToolLoopCompat: boolean;

@@ -8,7 +8,7 @@ No Node.js, no internet access, and no VS Code Marketplace account required on t
 | File | Purpose |
 |------|---------|
 | `install.bat` | One-click installer (Windows) — finds your VS Code install and installs the bundled extension |
-| `local-model-provider-custom-1.2.1.vsix` | The prebuilt extension package |
+| `local-model-provider-custom-1.2.2.vsix` | The prebuilt extension package |
 
 ## How to use on another computer
 
@@ -23,7 +23,7 @@ No Node.js, no internet access, and no VS Code Marketplace account required on t
 - Locates the VS Code CLI (`code`) on `PATH`, or in the standard install locations:
   `%LOCALAPPDATA%\Programs\Microsoft VS Code` (user install),
   `%ProgramFiles%\Microsoft VS Code` and `%ProgramFiles(x86)%\Microsoft VS Code` (machine installs).
-- Runs `code --install-extension local-model-provider-custom-1.2.1.vsix`.
+- Runs `code --install-extension local-model-provider-custom-1.2.2.vsix`.
 - Prints next steps on success, and a helpful fallback command if VS Code lives in a non-standard location.
 
 ## Rebuilding the .vsix (maintainers)

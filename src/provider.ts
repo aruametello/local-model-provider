@@ -5,8 +5,20 @@ import { SecretManager } from './secrets';
 import { StatisticsManager } from './statistics';
 import { parseQwenXmlToolCalls } from './qwenXml';
 
+// The authoritative context window for every model now comes from the server
+// metadata (`GatewayClient.extractContextLength`, e.g. llama.cpp status.args).
+// These are only used as a last-resort fallback when a server does not report
+// a context size at all. We deliberately do NOT expose them as settings — the
+// upstream server is the source of truth for both context and output limits.
+const FALLBACK_CONTEXT_WINDOW = 32768;
+// Default share of the context window reserved for output when splitting a
+// shared window into VS Code's maxInputTokens + maxOutputTokens. The output
+// budget is still capped at half the window; the server's own max-output limit
+// remains authoritative for actual generation length.
+const DEFAULT_OUTPUT_BUDGET = 4096;
+
 /**
- * Language model provider for OpenAI-compatible inference servers
+ * Language model provider for OpenAI-compatible inference APIs
  */
 export class GatewayProvider implements vscode.LanguageModelChatProvider {
   private readonly client: GatewayClient;
@@ -587,12 +599,25 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
       const models = response.data.map((model) => {
         const imageInput = this.detectVision(model.id, model, ollamaCaps, visionOverrides);
+        // Use the per-model context window reported by the server (e.g. llama.cpp
+        // --ctx-size / context_length override) when available; otherwise fall back
+        // to a built-in constant. Removed the configurable `defaultMaxTokens`
+        // setting — the upstream server is the source of truth for context size.
+        //
+        // IMPORTANT: VS Code's model picker and context-usage meter display
+        //   maxInputTokens + maxOutputTokens
+        // as the total context size (same convention as Copilot BYOK providers).
+        // So we must SPLIT the shared window into input + output budgets that sum
+        // back to the real context — never advertise full context as maxInput and
+        // also a separate maxOutput (that double-counts and inflates the UI).
+        const contextWindow = GatewayClient.extractContextLength(model) ?? FALLBACK_CONTEXT_WINDOW;
+        const { maxInputTokens, maxOutputTokens } = this.splitContextWindow(contextWindow);
         const modelInfo: vscode.LanguageModelChatInformation = {
           id: model.id,
           name: model.id,
           family: 'custom-local-model-provider',
-          maxInputTokens: this.config.defaultMaxTokens,
-          maxOutputTokens: this.config.defaultMaxOutputTokens,
+          maxInputTokens,
+          maxOutputTokens,
           version: '1.0.0',
           capabilities: {
             toolCalling: this.config.enableToolCalling,
@@ -600,6 +625,10 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
           },
         };
 
+        this.log(
+          'debug',
+          `Model ${model.id}: context=${contextWindow}, maxInput=${maxInputTokens}, maxOutput=${maxOutputTokens}`
+        );
         return modelInfo;
       });
 
@@ -608,7 +637,10 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       this.modelCacheTimestamp = now;
 
       const visionCount = models.filter(m => m.capabilities?.imageInput).length;
-      this.log('info', `Found ${models.length} models (${visionCount} with image input): ${models.map(m => m.id).join(', ')}`);
+      this.log(
+        'info',
+        `Found ${models.length} models (${visionCount} with image input): ${models.map(m => `${m.id}[${m.maxInputTokens}+${m.maxOutputTokens}]`).join(', ')}`
+      );
       return models;
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -798,16 +830,62 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   }
 
   /**
-   * Calculate safe max output tokens based on input estimate
+   * Split a shared context window into VS Code's maxInputTokens + maxOutputTokens.
+   *
+   * VS Code displays and meters context as `maxInputTokens + maxOutputTokens`
+   * (see chatModelsWidget / chatContextUsageWidget). Local servers (llama.cpp)
+   * expose a single shared n_ctx, so both budgets must sum back to that value.
+   *
+   * Mirrors Copilot BYOK `resolveModelTokenLimits`: output is the configured
+   * preference clamped to the window; input is whatever remains.
    */
-  private calculateSafeMaxOutputTokens(estimatedInputTokens: number, toolsOverhead: number): number {
-    const modelMaxContext = this.config.defaultMaxTokens || 32768;
+  private splitContextWindow(contextWindow: number): { maxInputTokens: number; maxOutputTokens: number } {
+    const windowSize = Math.max(128, contextWindow);
+    const desiredOutput = Math.max(64, DEFAULT_OUTPUT_BUDGET);
+    // Cap output at half the window so a large output budget cannot starve the
+    // input side — e.g. a 256k output preference on a 256k model would otherwise
+    // leave ~1 input token. The server's own max-output limit remains authoritative
+    // for how long the model may actually generate.
+    const halfWindow = Math.max(64, Math.floor(windowSize / 2));
+    const maxOutputTokens = Math.min(desiredOutput, halfWindow, windowSize - 64);
+    const maxInputTokens = Math.max(64, windowSize - maxOutputTokens);
+    return { maxInputTokens, maxOutputTokens };
+  }
+
+  /**
+   * Full shared context window for a model advertised to VS Code.
+   * Recovered as maxInput + maxOutput (the BYOK/VS Code convention).
+   */
+  private getModelContextWindow(model: vscode.LanguageModelChatInformation): number {
+    const summed = (model.maxInputTokens ?? 0) + (model.maxOutputTokens ?? 0);
+    if (summed > 0) {
+      return summed;
+    }
+    return FALLBACK_CONTEXT_WINDOW;
+  }
+
+  /**
+   * Calculate safe max output tokens based on input estimate.
+   *
+   * The configured `defaultMaxOutputTokens` setting is gone — the upstream
+   * server's own max-output limit is authoritative. We only use a built-in
+   * DEFAULT_OUTPUT_BUDGET as a safety cap so a single request can never consume
+   * the whole shared context window, then clamp to the space actually left for
+   * output after the estimated input + a small buffer. Omitting `max_tokens`
+   * entirely lets the server pick its own ceiling.
+   */
+  private calculateSafeMaxOutputTokens(
+    estimatedInputTokens: number,
+    toolsOverhead: number,
+    modelMaxContext: number
+  ): number {
     const totalEstimatedTokens = estimatedInputTokens + toolsOverhead;
     const conservativeInputEstimate = Math.ceil(totalEstimatedTokens * 1.2);
     const bufferTokens = 256;
+    const budgetCap = DEFAULT_OUTPUT_BUDGET;
 
-    let safeMaxOutputTokens = Math.min(
-      this.config.defaultMaxOutputTokens || 2048,
+    const safeMaxOutputTokens = Math.min(
+      budgetCap,
       Math.floor(modelMaxContext - conservativeInputEstimate - bufferTokens)
     );
 
@@ -910,7 +988,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     progress: vscode.Progress<vscode.LanguageModelResponsePart>
   ): Promise<void> {
     const inputTokenCount = await this.provideTokenCount(model, inputText, token);
-    const modelMaxContext = this.config.defaultMaxTokens || 32768;
+    const modelMaxContext = this.getModelContextWindow(model);
 
     this.log('warn', ` Model returned empty response with no tool calls.`);
     this.outputChannel.appendLine(`  Input tokens estimated: ${inputTokenCount}`);
@@ -977,7 +1055,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     const retryOptions: Record<string, unknown> = {
       ...baseRequestOptions,
       messages: finalMessages,
-      max_tokens: Math.min(Number(baseRequestOptions.max_tokens) || 4096, 4096),
+      max_tokens: Math.min(Number(baseRequestOptions.max_tokens) || DEFAULT_OUTPUT_BUDGET, DEFAULT_OUTPUT_BUDGET),
     };
     delete retryOptions.tools;
     delete retryOptions.tool_choice;
@@ -1009,6 +1087,15 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
    */
   private handleChatError(error: unknown): never {
     const errorMessage = error instanceof Error ? error.message : String(error);
+
+    // A user-initiated cancellation is not an error: the request was aborted
+    // (TCP connection torn down) so the upstream server stops generating.
+    // Swallow it silently — no notification, no error log.
+    if (errorMessage.toLowerCase().includes('cancelled')) {
+      this.log('info', 'Chat request cancelled by user.');
+      throw error;
+    }
+
     const errorStack = error instanceof Error ? error.stack : '';
 
     this.log('error', ` Chat request failed: ${errorMessage}`);
@@ -1077,9 +1164,17 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       this.log('debug', `  Message ${i + 1}: role=${msg.role}, hasContent=${!!msg.content}, hasToolCalls=${!!msg.tool_calls}, toolCallId=${toolCallId}`);
     }
 
-    // Calculate token limits; avoid premature truncation by checking a real estimate first
-    const modelMaxContext = this.config.defaultMaxTokens || 32768;
-    const desiredOutputTokens = Math.min(this.config.defaultMaxOutputTokens || 2048, Math.floor(modelMaxContext / 2));
+    // Calculate token limits; avoid premature truncation by checking a real estimate first.
+    // Full shared context = maxInputTokens + maxOutputTokens (VS Code/BYOK convention).
+    // Do NOT use maxInputTokens alone — that is only the input half of the split window.
+    const modelMaxContext = this.getModelContextWindow(model);
+    // Removed the configurable `defaultMaxOutputTokens` setting: the server's own
+    // limit governs generation length. We only reserve a conservative share of
+    // the context window (capped at half) for output so truncation has room.
+    const desiredOutputTokens = Math.min(
+      model.maxOutputTokens || DEFAULT_OUTPUT_BUDGET,
+      Math.floor(modelMaxContext / 2)
+    );
     const toolsTokenEstimate = options.tools ? Math.ceil(JSON.stringify(options.tools).length / 4 * 1.2) : 0;
     const reservedForInput = modelMaxContext - desiredOutputTokens - toolsTokenEstimate - 256;
 
@@ -1113,7 +1208,11 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
     const toolsOverhead = options.tools ? Math.ceil(JSON.stringify(options.tools).length / 4) : 0;
     const estimatedInputTokens = await this.provideTokenCount(model, inputText, token);
-    const safeMaxOutputTokens = this.calculateSafeMaxOutputTokens(estimatedInputTokens, toolsOverhead);
+    const safeMaxOutputTokens = this.calculateSafeMaxOutputTokens(
+      estimatedInputTokens,
+      toolsOverhead,
+      modelMaxContext
+    );
 
     this.log('debug',
       `Token estimate: input=${estimatedInputTokens}, tools=${toolsOverhead}, model_context=${modelMaxContext}, chosen_max_tokens=${safeMaxOutputTokens}`
@@ -1375,8 +1474,6 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       serverUrl: serverUrlRaw,
       apiKey: '', // Loaded from SecretStorage via initializeApiKey()
       requestTimeout: config.get<number>('requestTimeout', 60000),
-      defaultMaxTokens: config.get<number>('defaultMaxTokens', 32768),
-      defaultMaxOutputTokens: config.get<number>('defaultMaxOutputTokens', 4096),
       enableToolCalling: config.get<boolean>('enableToolCalling', true),
       parallelToolCalling: config.get<boolean>('parallelToolCalling', true),
       qwenToolLoopCompat: config.get<boolean>('qwenToolLoopCompat', false),
@@ -1402,18 +1499,6 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     } catch {
       this.log('error', ` Invalid server URL: ${cfg.serverUrl}`);
       throw new Error(`Invalid server URL: ${cfg.serverUrl}`);
-    }
-
-    // Validate defaultMaxOutputTokens relative to defaultMaxTokens
-    if (cfg.defaultMaxOutputTokens >= cfg.defaultMaxTokens) {
-      const adjusted = Math.max(64, cfg.defaultMaxTokens - 256);
-      this.outputChannel.appendLine(
-        `WARNING: github.copilot.llm-gateway.defaultMaxOutputTokens (${cfg.defaultMaxOutputTokens}) >= defaultMaxTokens (${cfg.defaultMaxTokens}). Adjusting to ${adjusted}.`
-      );
-      vscode.window.showWarningMessage(
-        `GitHub Copilot LLM Gateway: 'defaultMaxOutputTokens' was >= 'defaultMaxTokens'. Adjusted to ${adjusted} to avoid request errors.`
-      );
-      cfg.defaultMaxOutputTokens = adjusted;
     }
 
     return cfg;

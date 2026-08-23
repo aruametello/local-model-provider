@@ -145,8 +145,11 @@ All settings are under the `local.model.provider.*` namespace.
 - `requestTimeout` (number, ms): default 60000
 
 ### Token & Context Settings
-- `defaultMaxTokens` (number): estimated context window (default 32768). If your model/server supports larger context, consider increasing this for better continuity (e.g., 65k–128k).
-- `defaultMaxOutputTokens` (number): max generation tokens (default 4096). Increase when you need longer answers; ensure input + output stays within the model's context window.
+Context and output limits are **no longer configurable** — the upstream server is
+the source of truth. Each model's context window is read from the server metadata
+(e.g. llama.cpp `--ctx-size` / `context_length` in `status.args`) and advertised to
+VS Code; `max_tokens` is still sent but computed from that window so a request never
+starves the input side. The server's own max-output limit governs generation length.
 
 ### Function Calling
 - `enableToolCalling` (boolean): enable function calling (default true)

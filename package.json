@@ -2,7 +2,7 @@
   "name": "local-model-provider-custom",
   "displayName": "(custom) Local Model Provider",
   "description": "VS Code extension to connect to local LLM inference servers (Ollama, llama.cpp, LocalAI, LM Studio, vLLM) via OpenAI API compatible endpoints.",
-  "version": "1.2.1",
+  "version": "1.2.5",
   "publisher": "krevas",
   "icon": "assets/local-model-provider.png",
   "private": true,
@@ -132,23 +132,11 @@
           "description": "Request timeout in milliseconds",
           "order": 4
         },
-        "local.model.provider.defaultMaxTokens": {
-          "type": "number",
-          "default": 32768,
-          "description": "Default maximum input tokens for models (context window)",
-          "order": 4
-        },
-        "local.model.provider.defaultMaxOutputTokens": {
-          "type": "number",
-          "default": 4096,
-          "description": "Default maximum output tokens for models",
-          "order": 5
-        },
         "local.model.provider.enableToolCalling": {
           "type": "boolean",
           "default": true,
           "description": "Enable tool calling capability for models",
-          "order": 6
+          "order": 5
         },
         "local.model.provider.parallelToolCalling": {
           "type": "boolean",

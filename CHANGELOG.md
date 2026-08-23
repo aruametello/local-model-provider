@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.2.5
+
+### Removed
+- Removed the vestigial `defaultMaxTokens` and `defaultMaxOutputTokens` settings entirely. The upstream server is the source of truth for both context and output limits: each model's context window is parsed from server metadata (llama.cpp `status.args`), falling back to a built-in `FALLBACK_CONTEXT_WINDOW` constant; `max_tokens` is still sent but derived from that window (capped by a built-in `DEFAULT_OUTPUT_BUDGET`) so a request never starves the input side, and the server's own max-output limit governs generation length. Removed the old `loadConfig()` validation that warned when output tokens exceeded input tokens.
+
+## 1.2.4
+
+### Bug Fixes
+- **Context size no longer double-counts output tokens.** VS Code's model picker and context meter display `maxInputTokens + maxOutputTokens` as the total window. 1.2.3 advertised the full server context as `maxInputTokens` *and* a separate `defaultMaxOutputTokens` as `maxOutputTokens`, so every model appeared inflated by ~`defaultMaxOutputTokens` (e.g. 256k→512k, 512k→768k). The extension now splits each model's shared context window into input + output budgets that sum back to the real size (BYOK convention), caps advertised output at half the window so a large `defaultMaxOutputTokens` cannot starve input, and recovers the full window as `maxInput + maxOutput` for request budgeting.
+
+## 1.2.3
+
+### Bug Fixes
+- **Per-model context windows are now honored.** Previously every model was advertised with the same global `defaultMaxTokens` context size, so the chat context-window meter and truncation logic used one value for all models. The extension now reads each model's own context window from the server metadata (llama.cpp `--ctx-size` / `context_length` override in `status.args`) and passes it to VS Code via `maxInputTokens`, and uses it for token budgeting/truncation in chat requests. Models that don't report a context size still fall back to the `defaultMaxTokens` setting.
+
+## 1.2.2
+
+### Improvements
+- **Cancellation now aborts the upstream request.** When you stop/cancel a chat request, the extension immediately aborts the HTTP connection (via `AbortController`) instead of only stopping the local stream loop. This tears down the TCP connection so the upstream server (llama.cpp, vLLM, Ollama, …) stops generating an abandoned response instead of wasting compute. Cancellation also short-circuits retry backoff, and no error notification is shown for a user-initiated cancel.
+
 ## 1.2.1
 
 ### Removed

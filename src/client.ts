@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { randomBytes } from 'node:crypto';
 import {
   OpenAIChatCompletionRequest,
+  OpenAIModel,
   OpenAIModelsResponse,
   OpenAIUsage,
   OllamaModelCapabilities,
@@ -158,36 +159,78 @@ export class GatewayClient {
   }
 
   /**
-   * Fetch with retry logic
+   * Sleep that resolves early (false) if the caller cancels, so a retry
+   * backoff does not keep waiting on an abandoned request.
+   */
+  private sleepCancellable(ms: number, cancellationToken?: vscode.CancellationToken): Promise<boolean> {
+    return new Promise((resolve) => {
+      if (cancellationToken?.isCancellationRequested) {
+        resolve(false);
+        return;
+      }
+      let disposable: vscode.Disposable | undefined;
+      const timer = setTimeout(() => {
+        disposable?.dispose();
+        resolve(true);
+      }, ms);
+      disposable = cancellationToken?.onCancellationRequested(() => {
+        clearTimeout(timer);
+        resolve(false);
+      });
+    });
+  }
+
+  /**
+   * Fetch with retry logic.
+   *
+   * When a cancellationToken is provided, cancellation aborts the in-flight
+   * request immediately (tearing down the TCP connection so the upstream server
+   * stops generating) and also short-circuits any retry backoff.
    */
   private async fetchWithRetry(
     url: string,
     options: RequestInit,
-    operation: string
+    operation: string,
+    cancellationToken?: vscode.CancellationToken
   ): Promise<Response> {
     let lastError: Error | undefined;
     
     for (let attempt = 0; attempt <= this.retryConfig.maxRetries; attempt++) {
+      if (cancellationToken?.isCancellationRequested) {
+        throw new GatewayError(`${operation} cancelled`, undefined, false);
+      }
+
       try {
-        const response = await this.fetch(url, options);
+        const response = await this.fetch(url, options, cancellationToken);
         
         if (!response.ok && this.isRetryableError(null, response.status)) {
           if (attempt < this.retryConfig.maxRetries) {
             const delay = this.calculateBackoffDelay(attempt);
             console.log(`[LLM Gateway] ${operation} failed with status ${response.status}, retrying in ${delay}ms (attempt ${attempt + 1}/${this.retryConfig.maxRetries})`);
-            await this.sleep(delay);
+            const waited = await this.sleepCancellable(delay, cancellationToken);
+            if (!waited) {
+              throw new GatewayError(`${operation} cancelled`, undefined, false);
+            }
             continue;
           }
         }
         
         return response;
       } catch (error) {
+        // A user cancellation aborts the fetch; surface it as a clean cancellation
+        // rather than a retryable network error.
+        if (cancellationToken?.isCancellationRequested) {
+          throw new GatewayError(`${operation} cancelled`, undefined, false);
+        }
         lastError = error instanceof Error ? error : new Error(String(error));
         
         if (this.isRetryableError(error) && attempt < this.retryConfig.maxRetries) {
           const delay = this.calculateBackoffDelay(attempt);
           console.log(`[LLM Gateway] ${operation} failed with error: ${lastError.message}, retrying in ${delay}ms (attempt ${attempt + 1}/${this.retryConfig.maxRetries})`);
-          await this.sleep(delay);
+          const waited = await this.sleepCancellable(delay, cancellationToken);
+          if (!waited) {
+            throw new GatewayError(`${operation} cancelled`, undefined, false);
+          }
           continue;
         }
         
@@ -244,6 +287,47 @@ export class GatewayClient {
       }
       throw error;
     }
+  }
+
+  /**
+   * Extract the effective context window (in tokens) for a model from its
+   * server metadata. Currently supports llama.cpp, which exposes the launch
+   * args under `status.args`:
+   *   - `--ctx-size <n>` sets the KV-cache context size
+   *   - `--override-kv <key>=context_length=int:<n>` overrides the model's
+   *     native context length (e.g. YARN scaling)
+   * The override wins when present (it reflects the true usable context).
+   * Returns undefined when the server does not report a context size, so the
+   * caller falls back to a built-in context window.
+   */
+  public static extractContextLength(model: OpenAIModel): number | undefined {
+    const args = model.status?.args;
+    if (!Array.isArray(args) || args.length === 0) {
+      return undefined;
+    }
+
+    // 1. Prefer an explicit context_length override (--override-kv ...context_length=int:<n>)
+    for (const arg of args) {
+      const overrideMatch = /context_length\s*=\s*int:(\d+)/i.exec(arg);
+      if (overrideMatch) {
+        const value = Number(overrideMatch[1]);
+        if (Number.isFinite(value) && value > 0) {
+          return value;
+        }
+      }
+    }
+
+    // 2. Fall back to --ctx-size <n>
+    for (let i = 0; i < args.length - 1; i++) {
+      if (args[i] === '--ctx-size') {
+        const value = Number(args[i + 1]);
+        if (Number.isFinite(value) && value > 0) {
+          return value;
+        }
+      }
+    }
+
+    return undefined;
   }
 
   /**
@@ -549,7 +633,7 @@ export class GatewayClient {
         method: 'POST',
         headers: { ...this.getHeaders(), 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-      }, 'Chat completion');
+      }, 'Chat completion', cancellationToken);
 
       if (!response.ok) {
         const errorText = await response.text().catch(() => '');
@@ -621,6 +705,11 @@ export class GatewayClient {
         yield { content: '', tool_calls: [], finished_tool_calls: remaining };
       }
     } catch (error) {
+      // A user cancellation aborts the fetch/reader; surface it as a clean
+      // cancellation instead of a misleading "connection terminated" error.
+      if (cancellationToken.isCancellationRequested) {
+        throw new GatewayError('Chat completion cancelled', undefined, false);
+      }
       if (error instanceof GatewayError) {
         throw error;
       }
@@ -675,11 +764,23 @@ export class GatewayClient {
   }
 
   /**
-   * Fetch wrapper with timeout support
+   * Fetch wrapper with timeout support.
+   *
+   * When a cancellationToken is provided, user cancellation aborts the request
+   * immediately (closing the TCP connection so the upstream server stops
+   * generating an abandoned response).
    */
-  private async fetch(url: string, options: RequestInit): Promise<Response> {
+  private async fetch(
+    url: string,
+    options: RequestInit,
+    cancellationToken?: vscode.CancellationToken
+  ): Promise<Response> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.config.requestTimeout);
+
+    // Abort the request as soon as the user cancels, so the upstream server
+    // does not keep building a response nobody will read.
+    const cancelDisposable = cancellationToken?.onCancellationRequested(() => controller.abort());
 
     try {
       const response = await fetch(url, {
@@ -689,6 +790,7 @@ export class GatewayClient {
       return response;
     } finally {
       clearTimeout(timeoutId);
+      cancelDisposable?.dispose();
     }
   }
 }
