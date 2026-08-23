@@ -37,7 +37,17 @@ export function activate(context: vscode.ExtensionContext) {
   const serverUrl = config.get<string>('serverUrl', 'http://localhost:8000');
   statusBar.setStatus(ServerStatus.Unknown, { serverUrl });
 
-
+  // One-time cleanup (1.2.10): the `defaultModel` setting was removed — models
+  // now follow the upstream server's order. Clear any value users saved so it
+  // does not linger in settings.json as a dead option (mirrors the legacy
+  // apiKey -> SecretStorage migration pattern).
+  const defaultModelInspection = config.inspect<string>('defaultModel');
+  if (defaultModelInspection?.globalValue !== undefined) {
+    void config.update('defaultModel', undefined, vscode.ConfigurationTarget.Global);
+  }
+  if (defaultModelInspection?.workspaceValue !== undefined) {
+    void config.update('defaultModel', undefined, vscode.ConfigurationTarget.Workspace);
+  }
 
   // Register command to set API key securely
   const setApiKeyCommand = vscode.commands.registerCommand(
@@ -103,29 +113,21 @@ export function activate(context: vscode.ExtensionContext) {
           return;
         }
 
-        const currentDefault = vscode.workspace.getConfiguration('local.model.provider')
-          .get<string>('defaultModel', '');
-
+        // Models are shown in the order the upstream server reports them.
         const items: vscode.QuickPickItem[] = models.map((model) => ({
-          label: model.id === currentDefault ? `$(star-full) ${model.name}` : `$(symbol-method) ${model.name}`,
-          description: model.id === currentDefault ? 'Default' : '',
+          label: `$(symbol-method) ${model.name}`,
           detail: `Max Input: ${model.maxInputTokens} | Max Output: ${model.maxOutputTokens} | Tool Calling: ${model.capabilities?.toolCalling ? 'Yes' : 'No'} | Vision: ${model.capabilities?.imageInput ? 'Yes' : 'No'}`,
         }));
 
         const selected = await vscode.window.showQuickPick(items, {
-          placeHolder: 'Select a model (selecting sets as default)',
+          placeHolder: 'Available models (server order)',
           title: `Available Models (${models.length})`,
         });
 
         if (selected) {
-          const modelName = selected.label.replace(/^\$\([^)]+\)\s*/, '');
-          await vscode.workspace.getConfiguration('local.model.provider')
-            .update('defaultModel', modelName, vscode.ConfigurationTarget.Global);
-          
-          // Immediately update status bar to reflect the change
+          // Update the status bar to reflect a healthy connection + model count
           statusBar.setStatus(ServerStatus.Connected, { modelCount: models.length });
-          
-          vscode.window.showInformationMessage(`Default model set to: ${modelName}`);
+          vscode.window.showInformationMessage(`Model: ${selected.label.replace(/^\$\([^)]+\)\s*/, '')}`);
         }
       } catch (error) {
         vscode.window.showErrorMessage(`Failed to fetch models: ${error instanceof Error ? error.message : String(error)}`);
@@ -459,11 +461,6 @@ export function activate(context: vscode.ExtensionContext) {
         const newConfig = vscode.workspace.getConfiguration('local.model.provider');
         const newServerUrl = newConfig.get<string>('serverUrl', 'http://localhost:8000');
         statusBar.setStatus(ServerStatus.Unknown, { serverUrl: newServerUrl });
-      }
-      
-      // Clear model cache when defaultModel changes to force VS Code to refresh
-      if (e.affectsConfiguration('local.model.provider.defaultModel')) {
-        provider.clearModelCache();
       }
     })
   );

@@ -65,14 +65,14 @@ streams the completion back through `client.streamChatCompletion()`, and reports
 
 | File | Role | Notes |
 |------|------|-------|
-| `src/extension.ts` | Activation, command registration (setApiKey, showStatus, selectModel, switchServer, showStats, refreshModels), status bar wiring | Commands call into `provider` / `statusBar` / `statsManager`. Preset switching updates config then calls `provider.applyLatestConfiguration()` + `clearModelCache()`. |
+| `src/extension.ts` | Activation, command registration (setApiKey, showStatus, selectModel, switchServer, showStats, refreshModels), status bar wiring | Commands call into `provider` / `statusBar` / `statsManager`. Preset switching updates config then calls `provider.applyLatestConfiguration()` + `clearModelCache()`. `selectModel` is browse-only (models in server order — the `defaultModel` setting was removed in 1.2.10). Activation runs a one-time cleanup that deletes any leftover `defaultModel` value from user/workspace settings.json. |
 | `src/provider.ts` | **Core.** `GatewayProvider implements vscode.LanguageModelChatProvider` | Message conversion, token estimation/truncation, tool-call handling (incl. JSON repair), Qwen XML tool-call compat, vision detection + image forwarding, reasoning salvage + final-answer retry, model caching. |
 | `src/client.ts` | `GatewayClient`: HTTP with retry/backoff/jitter, SSE streaming parser for `/v1/chat/completions`, `/v1/models` fetch, Ollama `/api/tags` capability probe | Yields chunks `{ content, reasoning_content?, tool_calls, finished_tool_calls, finish_reason?, usage? }`. Tool calls accumulate **by index** during streaming (ids may arrive late). Injects `stream_options: { include_usage: true }` when `includeUsageInStream` is set; the trailing usage chunk arrives with an **empty `choices` array**, so `parseSSEData` must capture `usage` independently of delta/message. `fetch`/`fetchWithRetry` accept a `CancellationToken` and abort the request on cancel (TCP teardown); `sleepCancellable` short-circuits retry backoff. **`isRetryableError` walks the `error.cause` chain and checks `error.code`** so Node's `TypeError: fetch failed` (with `ECONNREFUSED`/`ETIMEDOUT`/`ECONNRESET` nested in `cause`) is retried. **`readWithIdleTimeout`** races each stream read against `requestTimeout` so a server that stalls mid-stream (after headers) is aborted with a retryable `GatewayError` instead of hanging. **`extractContextLength(model)`** (static) parses a model's effective context window from llama.cpp `status.args` (`--override-kv ...context_length=int:<n>` wins over `--ctx-size <n>`); returns `undefined` when absent so callers fall back to a built-in `FALLBACK_CONTEXT_WINDOW` (no `defaultMaxTokens` setting anymore). |
 | `src/types.ts` | All shared interfaces: `OpenAIModel`, `OpenAIMessage`, request/response/chunk types, `OllamaModelCapabilities`, `GatewayConfig` | Keep in sync with what `client.ts` sends/reads and what `loadConfig()` fills. `OpenAIModel` carries optional `status.args` (llama.cpp launch args) and `contextLength` (parsed effective context window). |
 | `src/secrets.ts` | `SecretManager`: API key in `vscode.SecretStorage` (key: `local.model.provider.apiKey`), legacy settings migration | Never log the key. |
 | `src/statusBar.ts` | Status bar item (`$(plug)/$(check)/$(error)` "Local LLM"), quick-pick status menu, server presets UI types (`ServerPreset`, `ServerStatus`) | |
 | `src/statistics.ts` | In-memory per-session request stats + `onStatsUpdate` event feeding the status bar | `formatTokens`/`formatDuration` are static helpers used by `extension.ts`. |
-| `src/qwenXml.ts` | Pure function `parseQwenXmlToolCalls()` — parses Qwen's raw XML tool-call format (`<tool_call><function=...><parameter=...>`) into structured calls; the only unit-tested module | Keep it dependency-free (no vscode import) so `tsconfig.test.json` can compile it standalone. |
+| `src/qwenXml.ts` | Pure function `parseQwenXmlToolCalls()` — parses Qwen's raw XML tool-call format (`<tool_call> <function=...> <parameter=...>`) into structured calls; the only unit-tested module | Keep it dependency-free (no vscode import) so `tsconfig.test.json` can compile it standalone. |
 | `test/qwenXml.test.ts` | Plain Node test runner for `qwenXml` (no framework) | Run via `npm test`. |
 | `docs/API.md` | Internal architecture docs (partially historical — verify against code before trusting) | |
 | `package.json` | Manifest: contributes commands + all `local.model.provider.*` settings; build scripts. `name` is `local-model-provider-custom` (fork id, coexists with the official extension); `displayName` is "(custom) Local Model Provider" | **Every new setting must be added here AND to `GatewayConfig` + `loadConfig()`.** Contributed command ids follow the `local-model-provider-custom.*` namespace — if you rename the `name` field again, update them in `package.json`, `extension.ts`, and `statusBar.ts` (and the model `family` in `provider.ts`). |
@@ -122,6 +122,13 @@ provideLanguageModelChatResponse(model, messages, options, progress, token)
  │    finished_tool_calls → JSON-repair args, fill missing required props, ToolCallPart
  │    usage             → tracked as lastUsage (from trailing stream_options chunk)
  ├─ post-stream:
+ │    if token.isCancellationRequested (the stream loop broke early), THROW a
+ │      GatewayError("Chat completion cancelled") right after the for-await so
+ │      handleChatError swallows it silently — never run usage reporting, stats,
+ │      salvage or final-answer retry for an abandoned request (1.2.9)
+ │    sanitize lastUsage to full OpenAI shape (prompt/completion/total; missing
+ │      fields -> 0 / derived total / estimate fallbacks) before the 'usage'
+ │      data part + stats, so partial server usage objects can't produce NaN
  │    report lastUsage to VS Code as a LanguageModelDataPart(mime 'usage', JSON payload)
  │    — this is what feeds the chat context-window meter / compaction; duck-typed,
  │    only sent when the runtime has LanguageModelDataPart
@@ -175,6 +182,21 @@ provideLanguageModelChatResponse(model, messages, options, progress, token)
   VS Code's built-in BYOK providers. It is reported post-stream in
   `provideLanguageModelChatResponse` (duck-typed, only when the runtime has
   `LanguageModelDataPart`). Keep it if you touch post-stream handling.
+- **Post-stream work must respect cancellation (1.2.9).** Right after the stream
+  loop, if `token.isCancellationRequested`, throw a "…cancelled" `GatewayError` so
+  usage reporting, stats, reasoning salvage and the final-answer retry are skipped
+  for abandoned chats (the retry would even fire a NEW upstream request).
+- **Sanitize server `usage` before consuming it (1.2.9).** Servers can send partial
+  usage objects; normalize to full OpenAI shape (`sanitizedUsage`: missing fields →
+  0 / derived total) before the 'usage' data part and stats, or session stats show
+  NaN.
+- **Models are listed in upstream server order (1.2.10+).** The `defaultModel` setting
+  and the client-side reordering it drove (added in 1.2.9) were REMOVED:
+  `provideLanguageModelChatInformation` returns `/v1/models` entries exactly as the
+  server provides them. The "View Models" command is browse-only (it no longer writes
+  any setting). Do NOT reintroduce a default-model setting, model reordering, or a
+  `defaultModel` config-change watcher — the upstream server's own ordering is
+  authoritative.
 
 ## 6. Build / test / package / install (verified working, Windows PowerShell)
 
@@ -252,6 +274,12 @@ Notes:
   version; command ids are `local-model-provider-custom.*`. If you ever rename the
   `name` field, remember the old id keeps any previously installed copies — users must
   uninstall the old id manually.
+- **Stale root artifacts leak into the vsix (1.2.9):** a committed `1.2.1.zip` was
+  bundled into every package (363 KB of dead payload) because `.vscodeignore` only
+  excludes patterns, not everything-by-default. `.vscodeignore` now explicitly excludes
+  `*.zip`, `out-test/**`, test files, and `tsconfig.test.json`, while keeping
+  `install_build/**/*.vsix` embedded (the installer artifact ships inside the new vsix).
+  If you add a new tracked root file, check whether it should be excluded from the package.
 
 ## 8. Change checklist (do ALL that apply per change)
 

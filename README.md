@@ -26,7 +26,7 @@ A VS Code extension that connects your editor to self‑hosted or local LLMs via
 - Status bar health monitor with quick actions
 - Server presets for quick switching between endpoints
 - Usage statistics tracking (requests, tokens, response times)
-- Default model selection for consistent workflow
+- Models listed in the order your server reports them (no reordering)
 
 ## 🔌 Compatible Inference Servers
 
@@ -141,8 +141,9 @@ All settings are under the `local.model.provider.*` namespace.
 ### Server Configuration
 - `serverUrl` (string): base URL, e.g. `http://localhost:8000`
 - `serverPresets` (array): saved server configurations for quick switching
-- `defaultModel` (string): default model ID to use (leave empty for auto-select)
 - `requestTimeout` (number, ms): default 60000
+
+> Models are listed exactly in the order the upstream server reports them (`/v1/models`). There is intentionally no "default model" setting or client-side reordering — use your server's own model ordering.
 
 ### Token & Context Settings
 Context and output limits are **no longer configurable** — the upstream server is
@@ -172,7 +173,7 @@ API keys are not stored in settings. Use the command palette:
 
 - "Local Model Provider: Set API Key (Secure)" — Store/remove API key in SecretStorage
 - "Local Model Provider: Show Server Status" — Open the status bar menu with quick actions
-- "Local Model Provider: View Models & Set Default" — Browse available models and set a default
+- "Local Model Provider: View Models" — Browse available models (shown in server order)
 - "Local Model Provider: Switch Server Preset" — Quick switch between configured server endpoints
 - "Local Model Provider: View Usage Statistics" — Display session statistics (requests, tokens, response times)
 - "Local Model Provider: Refresh Model Cache" — Clear cache and fetch models from server
@@ -180,7 +181,7 @@ API keys are not stored in settings. Use the command palette:
 ## 🏥 Status Bar Health Monitor
 
 See connection status at a glance. Click to open quick actions:
-- View and set default model
+- View available models (server order)
 - Switch server presets
 - View usage statistics
 - Refresh model cache

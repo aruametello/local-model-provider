@@ -601,6 +601,11 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         return modelInfo;
       });
 
+      // NOTE: models are returned in the exact order the upstream server's
+      // /v1/models endpoint provides them — no client-side reordering. (The
+      // `defaultModel` setting existed briefly in 1.2.9 and was removed in 1.2.10;
+      // do not reintroduce it or any preference-based ordering.)
+
       // Update cache
       this.cachedModels = models;
       this.modelCacheTimestamp = now;
@@ -1346,6 +1351,15 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         }
       }
 
+      // If the user cancelled mid-stream (the loop broke above), stop here and
+      // surface it as a clean cancellation so handleChatError swallows it
+      // silently. Without this, post-stream work (usage reporting, stats,
+      // reasoning salvage, final-answer retry) would run — and could even fire
+      // another upstream request — for a conversation the user abandoned.
+      if (token.isCancellationRequested) {
+        throw new GatewayError('Chat completion cancelled', undefined, false);
+      }
+
       if (this.config.qwenToolLoopCompat) {
         const parsedXml = this.extractXmlToolCalls(xmlToolBuffer);
         for (const toolCall of parsedXml.toolCalls) {
@@ -1360,34 +1374,51 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
       this.outputChannel.appendLine(`Completed chat request, received ${totalContent.length} characters, ${totalReasoningContent.length} reasoning characters, ${totalToolCalls} tool calls`);
 
+      // Some servers report a PARTIAL usage object (e.g. missing total_tokens).
+      // Normalize it to the OpenAI shape VS Code's usage validator expects and
+      // guard every field, so a partial object can never leak `undefined`/NaN
+      // into the statistics or fail validation in VS Code.
+      const sanitizedUsage: OpenAIUsage | undefined = lastUsage
+        ? {
+            prompt_tokens: typeof lastUsage.prompt_tokens === 'number' ? lastUsage.prompt_tokens : 0,
+            completion_tokens: typeof lastUsage.completion_tokens === 'number' ? lastUsage.completion_tokens : 0,
+            total_tokens: typeof lastUsage.total_tokens === 'number'
+              ? lastUsage.total_tokens
+              : (lastUsage.prompt_tokens ?? 0) + (lastUsage.completion_tokens ?? 0),
+          }
+        : undefined;
+
       // Report server-reported token usage to VS Code so the chat context-window
       // meter (and conversation compaction) tracks REAL token counts. VS Code
       // consumes a data part with mimeType 'usage' whose payload is an
       // OpenAI-shaped usage object — the same mechanism its built-in BYOK
       // providers use. Duck-typed for older runtimes without LanguageModelDataPart.
-      if (lastUsage && typeof (vscode as any).LanguageModelDataPart !== 'undefined') {
-        const usageJson = JSON.stringify(lastUsage);
+      if (sanitizedUsage && typeof (vscode as any).LanguageModelDataPart !== 'undefined') {
+        const usageJson = JSON.stringify(sanitizedUsage);
         progress.report(new (vscode as any).LanguageModelDataPart(
           new TextEncoder().encode(usageJson),
           'usage',
         ));
-        this.log('info', `Reported token usage to VS Code: prompt=${lastUsage.prompt_tokens}, completion=${lastUsage.completion_tokens}, total=${lastUsage.total_tokens}`);
+        this.log('info', `Reported token usage to VS Code: prompt=${sanitizedUsage.prompt_tokens}, completion=${sanitizedUsage.completion_tokens}, total=${sanitizedUsage.total_tokens}`);
       }
 
-      // Record statistics — prefer the server's real counts over estimates
+      // Record statistics — prefer the server's real counts over estimates.
+      // Fall back to estimates whenever the server omitted a field so stats
+      // never contain NaN.
       const responseTimeMs = Date.now() - requestStartTime;
-      const outputTokens = lastUsage
-        ? lastUsage.completion_tokens
+      const inputTokens = sanitizedUsage?.prompt_tokens ?? estimatedInputTokens;
+      const outputTokens = sanitizedUsage?.completion_tokens
+        ? sanitizedUsage.completion_tokens
         : Math.ceil((totalContent.length + totalReasoningContent.length) / 4);
       if (this.statsManager) {
         this.statsManager.recordRequest({
           modelId: model.id,
-          inputTokens: lastUsage ? lastUsage.prompt_tokens : estimatedInputTokens,
+          inputTokens,
           outputTokens,
           responseTimeMs,
         });
       }
-      this.log('info', `Response time: ${responseTimeMs}ms, Input tokens: ${lastUsage ? lastUsage.prompt_tokens : `~${estimatedInputTokens}`}, Output tokens: ${lastUsage ? outputTokens : `~${outputTokens}`}`);
+      this.log('info', `Response time: ${responseTimeMs}ms, Input tokens: ${sanitizedUsage ? inputTokens : `~${estimatedInputTokens}`}, Output tokens: ${sanitizedUsage && sanitizedUsage.completion_tokens > 0 ? outputTokens : `~${outputTokens}`}`);
 
       if (totalContent.length === 0 && totalToolCalls === 0) {
         if (totalReasoningContent.length > 0) {

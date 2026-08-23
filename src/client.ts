@@ -436,6 +436,13 @@ export class GatewayClient {
     for (const [index, tc] of state.toolCallsByIndex.entries()) {
       if (!state.finalizedIndices.has(index)) {
         state.finalizedIndices.add(index);
+        // Skip empty placeholder entries (a server can emit a tool-call slot
+        // with no name or arguments when finish_reason arrives); emitting one
+        // would surface an invalid, no-name tool call to VS Code. Matches the
+        // guard in getRemainingToolCalls().
+        if (!tc.name && !tc.arguments) {
+          continue;
+        }
         if (!tc.id) {
           tc.id = `call_${state.requestId}_${index}`;
         }

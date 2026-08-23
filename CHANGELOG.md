@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.2.10
+
+### Removed
+- **Removed the `defaultModel` setting.** The "View Models" command is now browse-only: models are listed exactly in the order the upstream server's `/v1/models` endpoint reports them, with no client-side reordering or per-model "default" preference. (This reverses the 1.2.9 feature that ordered a configured default model first — the server's own ordering is authoritative.)
+
+## 1.2.9
+
+### Bug Fixes
+- **Cancelled chats no longer run post-stream work (or fire a retry request).** If the user cancelled mid-stream, the provider now surfaces a clean "Chat completion cancelled" error right after the stream loop, so usage reporting, stats, reasoning salvage, and the final-answer retry are skipped for abandoned conversations.
+- **Partial server `usage` objects no longer produce NaN statistics.** Server-reported usage is normalized to the full OpenAI shape (`prompt_tokens` / `completion_tokens` / `total_tokens`) before being reported to VS Code's context meter or recorded in session stats; missing fields fall back to estimates/derived totals instead of leaking `undefined`.
+- **The `defaultModel` setting now actually takes effect.** It was written by the "View Models & Set Default" command but never consumed anywhere. The model list returned to VS Code now orders the configured default model first (and logs a warning if the id no longer exists on the server).
+- **Empty tool-call slots are no longer emitted.** `finalizeToolCalls` skips placeholder entries that have neither a name nor arguments (a server can open a tool-call slot and then end the stream with `finish_reason="tool_calls"`), matching the existing guard in `getRemainingToolCalls`.
+
 ## 1.2.8
 
 ### New Features

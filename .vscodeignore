@@ -26,14 +26,21 @@ pnpm-lock.yaml
 # Tests and docs (not required in VSIX)
 test/**
 tests/**
+out-test/**
 docs/**
 CONTRIBUTING.md
 CODE_OF_CONDUCT.md
 PROJECT_SUMMARY.md
 INSTALLATION_TESTING.md
+tsconfig.test.json
 
-# Misc
+# Stale release artifacts that must never ship inside the extension
+*.zip
+
+# Misc — exclude root build artifacts, but keep the portable installer's
+# bundled vsix embedded in the package (see AGENTS.md §6 release workflow)
 *.vsix
+!install_build/**/*.vsix
 *.log
 .DS_Store
 Thumbs.db

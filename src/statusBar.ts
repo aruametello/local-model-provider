@@ -164,7 +164,7 @@ export class StatusBarManager implements vscode.Disposable {
     const items: vscode.QuickPickItem[] = [
       {
         label: '$(list-unordered) View Models',
-        description: 'View available models and set default',
+        description: 'View available models (server order)',
       },
       {
         label: '$(server) Switch Server',
