@@ -4,6 +4,7 @@ import { GatewayConfig, OpenAIChatCompletionRequest, OpenAIUsage, OllamaModelCap
 import { SecretManager } from './secrets';
 import { StatisticsManager } from './statistics';
 import { parseQwenXmlToolCalls } from './qwenXml';
+import { buildCrashReport, writeCrashReport } from './crashLog';
 
 // The authoritative context window for every model now comes from the server
 // metadata (`GatewayClient.extractContextLength`, e.g. llama.cpp status.args).
@@ -167,6 +168,15 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       const prefix = level.toUpperCase().padEnd(5);
       this.outputChannel.appendLine(`[${timestamp}] [${prefix}] ${message}`);
     }
+  }
+
+  /**
+   * A redacted, serializable view of the current config for crash reports.
+   * The API key is never included.
+   */
+  private configToLog(): Record<string, unknown> {
+    const { apiKey, ...rest } = this.config;
+    return { ...rest, apiKey: apiKey ? '[REDACTED]' : '(not set)' };
   }
 
   /**
@@ -1102,7 +1112,18 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   /**
    * Handle chat request error
    */
-  private handleChatError(error: unknown): never {
+  private async handleChatError(
+    error: unknown,
+    model?: vscode.LanguageModelChatInformation,
+    snapshot?: {
+      messageCount?: number;
+      estimatedInputTokens?: number;
+      toolsOverhead?: number;
+      modelMaxContext?: number;
+      chosenMaxTokens?: number | undefined;
+      requestOptions?: Record<string, unknown>;
+    }
+  ): Promise<never> {
     const errorMessage = error instanceof Error ? error.message : String(error);
 
     // A user-initiated cancellation is not an error: the request was aborted
@@ -1128,6 +1149,18 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       this.outputChannel.appendLine(`Stack trace: ${errorStack}`);
     }
 
+    // Write a "how did I get here" crash report to disk so a failure can be
+    // debugged later without reproducing it live. The path is appended to the
+    // user-facing message below.
+    const report = buildCrashReport(this.context, model, error, {
+      ...snapshot,
+      config: this.configToLog(),
+    });
+    const crashLogPath = await writeCrashReport(this.context, report);
+    if (crashLogPath) {
+      this.log('info', `Crash report written to ${crashLogPath}`);
+    }
+
     const isToolError = errorMessage.includes('HarmonyError') || errorMessage.includes('unexpected tokens');
 
     if (isToolError) {
@@ -1146,7 +1179,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         }
       });
     } else {
-      vscode.window.showErrorMessage(`Local Model Provider: Chat request failed. ${errorMessage}`);
+      const logHint = crashLogPath ? `\n\nA crash report was saved to:\n${crashLogPath}` : '';
+      vscode.window.showErrorMessage(`Local Model Provider: Chat request failed. ${errorMessage}${logHint}`);
     }
 
     throw error;
@@ -1455,7 +1489,14 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         }
       }
     } catch (error) {
-      this.handleChatError(error);
+      await this.handleChatError(error, model, {
+        messageCount: openAIMessages.length,
+        estimatedInputTokens,
+        toolsOverhead,
+        modelMaxContext,
+        chosenMaxTokens: safeMaxOutputTokens,
+        requestOptions,
+      });
     }
   }
 

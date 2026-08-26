@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.12
+
+### New Features
+- **Crash reports for failed chat requests.** When a chat request fails (other than a user cancellation), the extension now writes a "how did I get here" snapshot to a log file in its global storage directory (`crash-<timestamp>.log`) and appends the file path to the error notification. The report captures the model, the token budget math (`estimatedInputTokens`, `toolsOverhead`, `modelMaxContext`, `chosenMaxOutputTokens`), the request options, and a redacted config — so a failure can be debugged later without reproducing it live. Secrets (API keys, bearer tokens, base64 image payloads) are redacted before writing.
+
 ## 1.2.11
 
 ### Bug Fixes

@@ -73,6 +73,7 @@ streams the completion back through `client.streamChatCompletion()`, and reports
 | `src/statusBar.ts` | Status bar item (`$(plug)/$(check)/$(error)` "Local LLM"), quick-pick status menu, server presets UI types (`ServerPreset`, `ServerStatus`) | |
 | `src/statistics.ts` | In-memory per-session request stats + `onStatsUpdate` event feeding the status bar | `formatTokens`/`formatDuration` are static helpers used by `extension.ts`. |
 | `src/qwenXml.ts` | Pure function `parseQwenXmlToolCalls()` — parses Qwen's raw XML tool-call format (`<tool_call> <function=...> <parameter=...>`) into structured calls; the only unit-tested module | Keep it dependency-free (no vscode import) so `tsconfig.test.json` can compile it standalone. |
+| `src/crashLog.ts` | `buildCrashReport()` + `writeCrashReport()` — writes a "how did I get here" snapshot to `context.globalStorageUri` whenever a chat request fails, and returns the file path so `handleChatError` can surface it to the user | Redacts API keys / bearer tokens / base64 image payloads before writing. Never let logging itself break the user-facing error path (wrapped in try/catch). |
 | `test/qwenXml.test.ts` | Plain Node test runner for `qwenXml` (no framework) | Run via `npm test`. |
 | `docs/API.md` | Internal architecture docs (partially historical — verify against code before trusting) | |
 | `package.json` | Manifest: contributes commands + all `local.model.provider.*` settings; build scripts. `name` is `local-model-provider-custom` (fork id, coexists with the official extension); `displayName` is "(custom) Local Model Provider" | **Every new setting must be added here AND to `GatewayConfig` + `loadConfig()`.** Contributed command ids follow the `local-model-provider-custom.*` namespace — if you rename the `name` field again, update them in `package.json`, `extension.ts`, and `statusBar.ts` (and the model `family` in `provider.ts`). |
@@ -162,6 +163,15 @@ provideLanguageModelChatResponse(model, messages, options, progress, token)
   statuses (429/5xx + network errors).
 - **Errors:** throw `GatewayError(message, statusCode?, isRetryable?, original?)`.
   User-facing failures go through `handleChatError()` (notification + output channel).
+- **Crash reports (1.2.12+):** `handleChatError()` writes a "how did I get here"
+  snapshot to `context.globalStorageUri` (`crash-<timestamp>.log`) for every
+  non-cancellation chat failure, and appends the file path to the error
+  notification so users can attach it to a bug report. The snapshot includes the
+  model, token budget (`estimatedInputTokens`, `toolsOverhead`, `modelMaxContext`,
+  `chosenMaxOutputTokens`), the request options, and a redacted config. Secrets
+  (API key, bearer tokens, base64 image payloads) are redacted in `crashLog.ts`
+  before writing. Cancellations are still swallowed silently (no crash log). If
+  you change error handling, keep the crash-log write and the path hint.
 - **Logging:** `this.log(level, msg)` writes to the "Local Model Provider" output channel,
   filtered by `logLevel` setting. Never log API keys or full base64 payloads.
 - **Config changes:** any new setting requires edits in THREE places:
