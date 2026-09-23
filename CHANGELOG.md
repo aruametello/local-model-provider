@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.2.14
+
+### Bug Fixes
+- **Qwen XML tool-call tag detection no longer breaks when `<tool_call` splits across stream chunks.** Token-by-token streaming can split the opening tag across two SSE chunks (e.g. `"<tool_c"` then `"all>..."`); previously this either leaked raw XML into the visible chat response or silently dropped the tool call entirely (in the reasoning-content path). Detection now holds back an unconfirmed tag-prefix suffix across chunk boundaries (`consumeForXmlToolStart`) instead of deciding per-chunk.
+- **Qwen final-answer retry's token usage is now reported.** When a reasoning-only response triggers the no-tools final-answer retry, the retry fires a whole extra upstream request whose token cost was previously invisible to both VS Code's context-window meter and session statistics. The retry now captures its own `usage` chunk and reports/records it.
+- **`modelOptions` passed by callers can no longer clobber core request fields.** `Object.assign(requestOptions, options.modelOptions)` had no allow-list, so a caller-supplied `model`/`messages`/`tools`/etc. could silently override the extension's own budgeting and truncation. Now merged through an allow-list that protects those fields.
+- **Pruned assistant tool-call messages no longer send an empty `tool_calls: []`.** Some strict OpenAI-compatible servers expect the field omitted entirely when there are no calls left after truncation; it's now deleted instead of left as an empty array.
+- **`extractContextLength` now also parses the `--ctx-size=8192` single-token launch-arg form** (previously only the two-array-element `--ctx-size 8192` form matched), avoiding an under-reported fallback context window on servers that report args this way.
+- **Streamed tool-call fragments with no `index` field are no longer split into multiple bogus tool calls.** Some non-conforming servers omit `index` on every delta of the same call; continuation fragments now reuse the most recently attributed index instead of incrementing a counter each time.
+
+## 1.2.13
+
+### Bug Fixes
+- **Fixed corrupted upstream requests from unpaired UTF-16 surrogates.** Certain emoji/ZWJ sequences (mangled by clipboard/IME edge cases) or a lone surrogate landing on a char-index truncation boundary could leave an unpaired UTF-16 surrogate in message content. `JSON.stringify` turns that into a bare `\uXXXX` escape — syntactically valid JSON but not a valid Unicode scalar value — which strict JSON parsers on inference servers (e.g. llama.cpp's nlohmann::json) reject as malformed, surfacing as a confusing "invalid request" error. The outgoing request body is now serialized with a `JSON.stringify` replacer that replaces any unpaired surrogate half with U+FFFD before the request leaves the process.
+
 ## 1.2.12
 
 ### New Features

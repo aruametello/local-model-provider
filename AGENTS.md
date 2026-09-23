@@ -67,12 +67,12 @@ streams the completion back through `client.streamChatCompletion()`, and reports
 |------|------|-------|
 | `src/extension.ts` | Activation, command registration (setApiKey, showStatus, selectModel, switchServer, showStats, refreshModels), status bar wiring | Commands call into `provider` / `statusBar` / `statsManager`. Preset switching updates config then calls `provider.applyLatestConfiguration()` + `clearModelCache()`. `selectModel` is browse-only (models in server order — the `defaultModel` setting was removed in 1.2.10). Activation runs a one-time cleanup that deletes any leftover `defaultModel` value from user/workspace settings.json. |
 | `src/provider.ts` | **Core.** `GatewayProvider implements vscode.LanguageModelChatProvider` | Message conversion, token estimation/truncation, tool-call handling (incl. JSON repair), Qwen XML tool-call compat, vision detection + image forwarding, reasoning salvage + final-answer retry, model caching. |
-| `src/client.ts` | `GatewayClient`: HTTP with retry/backoff/jitter, SSE streaming parser for `/v1/chat/completions`, `/v1/models` fetch, Ollama `/api/tags` capability probe | Yields chunks `{ content, reasoning_content?, tool_calls, finished_tool_calls, finish_reason?, usage? }`. Tool calls accumulate **by index** during streaming (ids may arrive late). Injects `stream_options: { include_usage: true }` when `includeUsageInStream` is set; the trailing usage chunk arrives with an **empty `choices` array**, so `parseSSEData` must capture `usage` independently of delta/message. `fetch`/`fetchWithRetry` accept a `CancellationToken` and abort the request on cancel (TCP teardown); `sleepCancellable` short-circuits retry backoff. **`isRetryableError` walks the `error.cause` chain and checks `error.code`** so Node's `TypeError: fetch failed` (with `ECONNREFUSED`/`ETIMEDOUT`/`ECONNRESET` nested in `cause`) is retried. **`readWithIdleTimeout`** races each stream read against `requestTimeout` so a server that stalls mid-stream (after headers) is aborted with a retryable `GatewayError` instead of hanging. **`extractContextLength(model)`** (static) parses a model's effective context window from llama.cpp `status.args` (`--override-kv ...context_length=int:<n>` wins over `--ctx-size <n>`); returns `undefined` when absent so callers fall back to a built-in `FALLBACK_CONTEXT_WINDOW` (no `defaultMaxTokens` setting anymore). |
+| `src/client.ts` | `GatewayClient`: HTTP with retry/backoff/jitter, SSE streaming parser for `/v1/chat/completions`, `/v1/models` fetch, Ollama `/api/tags` capability probe | Yields chunks `{ content, reasoning_content?, tool_calls, finished_tool_calls, finish_reason?, usage? }`. Tool calls accumulate **by index** during streaming (ids may arrive late). Injects `stream_options: { include_usage: true }` when `includeUsageInStream` is set; the trailing usage chunk arrives with an **empty `choices` array**, so `parseSSEData` must capture `usage` independently of delta/message. `fetch`/`fetchWithRetry` accept a `CancellationToken` and abort the request on cancel (TCP teardown); `sleepCancellable` short-circuits retry backoff. **`isRetryableError` walks the `error.cause` chain and checks `error.code`** so Node's `TypeError: fetch failed` (with `ECONNREFUSED`/`ETIMEDOUT`/`ECONNRESET` nested in `cause`) is retried. **`readWithIdleTimeout`** races each stream read against `requestTimeout` so a server that stalls mid-stream (after headers) is aborted with a retryable `GatewayError` instead of hanging. **`extractContextLength(model)`** (static) parses a model's effective context window from llama.cpp `status.args` (`--override-kv ...context_length=int:<n>` wins over `--ctx-size <n>`); returns `undefined` when absent so callers fall back to a built-in `FALLBACK_CONTEXT_WINDOW` (no `defaultMaxTokens` setting anymore). **`sanitizeLoneSurrogates()`** (module-level function) is applied via the `JSON.stringify(body, replacer)` replacer in `streamChatCompletion` — it replaces any unpaired UTF-16 surrogate half in outgoing string values with U+FFFD before the request body is serialized. This is the single choke point for the outgoing HTTP body; keep it if you ever add a second request-building path. |
 | `src/types.ts` | All shared interfaces: `OpenAIModel`, `OpenAIMessage`, request/response/chunk types, `OllamaModelCapabilities`, `GatewayConfig` | Keep in sync with what `client.ts` sends/reads and what `loadConfig()` fills. `OpenAIModel` carries optional `status.args` (llama.cpp launch args) and `contextLength` (parsed effective context window). |
 | `src/secrets.ts` | `SecretManager`: API key in `vscode.SecretStorage` (key: `local.model.provider.apiKey`), legacy settings migration | Never log the key. |
 | `src/statusBar.ts` | Status bar item (`$(plug)/$(check)/$(error)` "Local LLM"), quick-pick status menu, server presets UI types (`ServerPreset`, `ServerStatus`) | |
 | `src/statistics.ts` | In-memory per-session request stats + `onStatsUpdate` event feeding the status bar | `formatTokens`/`formatDuration` are static helpers used by `extension.ts`. |
-| `src/qwenXml.ts` | Pure function `parseQwenXmlToolCalls()` — parses Qwen's raw XML tool-call format (`<tool_call> <function=...> <parameter=...>`) into structured calls; the only unit-tested module | Keep it dependency-free (no vscode import) so `tsconfig.test.json` can compile it standalone. |
+| `src/qwenXml.ts` | Pure function `parseQwenXmlToolCalls()` — parses Qwen's raw XML tool-call format (`<tool_call> <function=...> <parameter=...>`) into structured calls; the only unit-tested module | Keep it dependency-free (no vscode import) so `tsconfig.test.json` can compile it standalone. The caller (`provider.ts`) is responsible for reassembling a `<tool_call` opening tag that streamed split across two SSE chunks BEFORE handing text to this parser — see `consumeForXmlToolStart`/`appendXmlToolBuffer`. |
 | `src/crashLog.ts` | `buildCrashReport()` + `writeCrashReport()` — writes a "how did I get here" snapshot to `context.globalStorageUri` whenever a chat request fails, and returns the file path so `handleChatError` can surface it to the user | Redacts API keys / bearer tokens / base64 image payloads before writing. Never let logging itself break the user-facing error path (wrapped in try/catch). |
 | `test/qwenXml.test.ts` | Plain Node test runner for `qwenXml` (no framework) | Run via `npm test`. |
 | `docs/API.md` | Internal architecture docs (partially historical — verify against code before trusting) | |
@@ -290,6 +290,37 @@ Notes:
   `*.zip`, `out-test/**`, test files, and `tsconfig.test.json`, while keeping
   `install_build/**/*.vsix` embedded (the installer artifact ships inside the new vsix).
   If you add a new tracked root file, check whether it should be excluded from the package.
+- **Unpaired UTF-16 surrogates in message content corrupt the outgoing request
+  (found investigating an "oddball emoji" report).** `JSON.stringify` on a lone
+  surrogate emits a bare `\uXXXX` escape — syntactically valid JSON grammar, but
+  not a valid Unicode scalar value. Strict JSON parsers on inference servers
+  (e.g. llama.cpp's nlohmann::json) reject that as malformed and the server
+  error looks like garbled/invalid JSON even though our side produced
+  well-formed JSON *text*. Lone surrogates can appear from mangled chat input
+  (clipboard/IME edge cases with ZWJ emoji sequences) or from any future
+  char-index string truncation that happens to land inside a surrogate pair
+  (e.g. `retryQwenFinalAnswer`'s `reasoningChars.slice(0, maxReasoningChars)`
+  in `provider.ts`, which is UTF-16-code-unit based, not code-point based).
+  Fixed by sanitizing at the single point the wire body is produced:
+  `client.ts` `streamChatCompletion` now serializes with
+  `JSON.stringify(body, replacer)` where the replacer calls
+  `sanitizeLoneSurrogates()` on every string value, replacing unpaired
+  surrogate halves with U+FFFD before the request ever leaves the process. If
+  you add a second place that builds a request body, apply the same replacer.
+- **A streamed tag can split across two SSE chunks — never decide "is this a
+  tag" from a single chunk in isolation.** The Qwen XML tool-call compat path
+  (`qwenToolLoopCompat`) used to check `chunk.content.indexOf('<tool_call')`
+  per chunk; a token-by-token server can emit `"<tool_c"` then `"all>..."`,
+  which either leaked raw XML into the visible response (content path) or
+  silently dropped the whole tool call (reasoning_content path — none of its
+  branches matched a bare fragment). Fixed with `consumeForXmlToolStart()` +
+  `longestTagPrefixOverlap()`: any trailing text that could still be an
+  unconfirmed prefix of `<tool_call` is held back (`xmlPendingContent`/
+  `xmlPendingReasoning`) across chunk boundaries instead of being flushed or
+  dropped, and only resolved once a following chunk proves or disproves it.
+  Any leftover pending text is flushed as visible content at end-of-stream. If
+  you touch this path, keep the pending/hold-back pattern — do not go back to
+  a single-chunk substring check.
 
 ## 8. Change checklist (do ALL that apply per change)
 

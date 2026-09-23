@@ -30,6 +30,23 @@ const DEFAULT_RETRY_CONFIG: RetryConfig = {
 };
 
 /**
+ * Replace unpaired UTF-16 surrogate halves with U+FFFD. Lone surrogates can
+ * reach message content from odd emoji/ZWJ sequences mangled upstream (chat
+ * input, clipboard) or from our own char-index string truncation. JSON.stringify
+ * emits an unpaired surrogate as a bare `\uXXXX` escape — syntactically valid
+ * JSON, but not a valid Unicode scalar value — which strict JSON parsers on
+ * inference servers (e.g. llama.cpp's nlohmann::json) reject as malformed,
+ * surfacing as a confusing "invalid request" error. Sanitize right before the
+ * wire format is produced so no code path can leak one through.
+ */
+function sanitizeLoneSurrogates(value: string): string {
+  return value.replace(
+    /([\uD800-\uDBFF])(?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])([\uDC00-\uDFFF])/g,
+    '\uFFFD'
+  );
+}
+
+/**
  * Error class for Gateway-specific errors
  */
 export class GatewayError extends Error {
@@ -61,6 +78,10 @@ interface ToolCallState {
   finalizedIndices: Set<number>;
   requestId: string;
   toolCallCounter: number;
+  // Index a delta with no explicit `index` was last attributed to, so
+  // continuation fragments of the same call (common with servers that never
+  // send `index`) reuse it instead of each being counted as a new call.
+  lastImplicitIndex?: number;
 }
 
 /**
@@ -326,10 +347,17 @@ export class GatewayClient {
       }
     }
 
-    // 2. Fall back to --ctx-size <n>
-    for (let i = 0; i < args.length - 1; i++) {
-      if (args[i] === '--ctx-size') {
+    // 2. Fall back to --ctx-size <n> (separate args) or --ctx-size=<n> (single token)
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === '--ctx-size' && i < args.length - 1) {
         const value = Number(args[i + 1]);
+        if (Number.isFinite(value) && value > 0) {
+          return value;
+        }
+      }
+      const inlineMatch = /^--ctx-size=(\d+)$/.exec(args[i]);
+      if (inlineMatch) {
+        const value = Number(inlineMatch[1]);
         if (Number.isFinite(value) && value > 0) {
           return value;
         }
@@ -392,7 +420,21 @@ export class GatewayClient {
     tc: { index?: number; id?: string; function?: { name?: string; arguments?: string } },
     state: ToolCallState
   ): void {
-    const index = tc.index ?? state.toolCallCounter++;
+    let index: number;
+    if (tc.index !== undefined) {
+      index = tc.index;
+    } else if (
+      state.lastImplicitIndex !== undefined &&
+      (!tc.id || tc.id === state.toolCallsByIndex.get(state.lastImplicitIndex)?.id)
+    ) {
+      // No index on this delta: a new distinct id would mean the server moved
+      // on to another call, but otherwise treat it as a continuation of the
+      // most recent implicit-index call rather than a brand new one.
+      index = state.lastImplicitIndex;
+    } else {
+      index = state.toolCallCounter++;
+    }
+    state.lastImplicitIndex = index;
     const existing = state.toolCallsByIndex.get(index);
 
     if (existing) {
@@ -645,7 +687,9 @@ export class GatewayClient {
       const response = await this.fetchWithRetry(url, {
         method: 'POST',
         headers: { ...this.getHeaders(), 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        // Replacer sanitizes every string value in one pass over the JSON tree
+        // (see sanitizeLoneSurrogates) instead of a separate deep-clone.
+        body: JSON.stringify(body, (_key, val) => typeof val === 'string' ? sanitizeLoneSurrogates(val) : val),
       }, 'Chat completion', cancellationToken);
 
       if (!response.ok) {
@@ -837,6 +881,11 @@ export class GatewayClient {
         const timeoutId = setTimeout(() => {
           controller.abort();
           void reader.cancel();
+          // NOTE: marked retryable for classification purposes (crash logs,
+          // isRetryableError-style checks a future caller might add), but no
+          // caller currently retries a stream already in progress — this
+          // error propagates straight out of streamChatCompletion's generator
+          // to provider.ts's error handler. Don't assume auto-retry happens.
           reject(new GatewayError(
             `Chat completion stream timed out after ${this.config.requestTimeout}ms with no data`,
             undefined,

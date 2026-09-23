@@ -468,7 +468,14 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
           // No retained results and no content — the whole message is orphaned.
           continue;
         }
-        result.push({ ...msg, tool_calls: keptCalls });
+        if (keptCalls.length === 0) {
+          // Some strict OpenAI-compatible servers expect tool_calls to be
+          // omitted entirely when there are none, not an empty array.
+          const { tool_calls: _dropped, ...rest } = msg;
+          result.push(rest);
+        } else {
+          result.push({ ...msg, tool_calls: keptCalls });
+        }
       } else {
         result.push(msg);
       }
@@ -980,6 +987,46 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   }
 
   /**
+   * Length of the longest suffix of `text` that is also a proper prefix of
+   * `tag` — i.e. how many trailing characters could be the start of a tag
+   * split across a stream chunk boundary, and must be held back instead of
+   * flushed as visible text.
+   */
+  private longestTagPrefixOverlap(text: string, tag: string): number {
+    const maxLen = Math.min(text.length, tag.length - 1);
+    for (let len = maxLen; len > 0; len--) {
+      if (text.endsWith(tag.slice(0, len))) {
+        return len;
+      }
+    }
+    return 0;
+  }
+
+  /**
+   * Streaming-safe detector for the start of a Qwen `<tool_call` tag. A tag
+   * can arrive split across two or more SSE chunks (e.g. `"<tool_c"` then
+   * `"all>..."`), so any not-yet-confirmed trailing text that could be a
+   * partial tag prefix must be held back in `pending` rather than flushed or
+   * dropped, until a following chunk proves or disproves it.
+   */
+  private consumeForXmlToolStart(
+    pending: string,
+    chunk: string
+  ): { visible: string; pending: string; tagStart?: string } {
+    const tag = '<tool_call';
+    const combined = pending + chunk;
+    const idx = combined.indexOf(tag);
+    if (idx !== -1) {
+      return { visible: combined.slice(0, idx), pending: '', tagStart: combined.slice(idx) };
+    }
+    const overlap = this.longestTagPrefixOverlap(combined, tag);
+    return {
+      visible: combined.slice(0, combined.length - overlap),
+      pending: combined.slice(combined.length - overlap),
+    };
+  }
+
+  /**
    * Handle empty response from model
    */
   private async handleEmptyResponse(
@@ -1042,7 +1089,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     reasoningContent: string,
     modelMaxContext: number,
     progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-    token: vscode.CancellationToken
+    token: vscode.CancellationToken,
+    modelId: string
   ): Promise<boolean> {
     const finalMessages = [...messages];
     if (reasoningContent.trim()) {
@@ -1090,11 +1138,16 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
     let contentLength = 0;
     let retryReasoningLength = 0;
+    let retryUsage: OpenAIUsage | undefined;
+    const retryStartTime = Date.now();
     this.log('info', 'Qwen tool-loop compatibility: running final-answer retry without tools.');
 
     for await (const chunk of this.client.streamChatCompletion(retryOptions as unknown as OpenAIChatCompletionRequest, token)) {
       if (token.isCancellationRequested) {
         break;
+      }
+      if (chunk.usage) {
+        retryUsage = chunk.usage;
       }
       if (chunk.reasoning_content) {
         retryReasoningLength += chunk.reasoning_content.length;
@@ -1106,6 +1159,34 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     }
 
     this.log('info', `Qwen final-answer retry produced ${contentLength} content characters, ${retryReasoningLength} reasoning characters.`);
+
+    // The retry is a whole extra upstream request; without this, its token
+    // cost was invisible to both VS Code's context-window meter and session
+    // stats (only the original, empty response had been reported/recorded).
+    const sanitizedRetryUsage: OpenAIUsage | undefined = retryUsage
+      ? {
+          prompt_tokens: typeof retryUsage.prompt_tokens === 'number' ? retryUsage.prompt_tokens : 0,
+          completion_tokens: typeof retryUsage.completion_tokens === 'number' ? retryUsage.completion_tokens : 0,
+          total_tokens: typeof retryUsage.total_tokens === 'number'
+            ? retryUsage.total_tokens
+            : (retryUsage.prompt_tokens ?? 0) + (retryUsage.completion_tokens ?? 0),
+        }
+      : undefined;
+    if (sanitizedRetryUsage && typeof (vscode as any).LanguageModelDataPart !== 'undefined') {
+      progress.report(new (vscode as any).LanguageModelDataPart(
+        new TextEncoder().encode(JSON.stringify(sanitizedRetryUsage)),
+        'usage',
+      ));
+    }
+    if (this.statsManager) {
+      this.statsManager.recordRequest({
+        modelId,
+        inputTokens: sanitizedRetryUsage?.prompt_tokens ?? Math.ceil(reasoningContent.length / 4),
+        outputTokens: sanitizedRetryUsage?.completion_tokens ?? Math.ceil((contentLength + retryReasoningLength) / 4),
+        responseTimeMs: Date.now() - retryStartTime,
+      });
+    }
+
     return contentLength > 0;
   }
 
@@ -1306,7 +1387,14 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     }
 
     if (options.modelOptions) {
-      Object.assign(requestOptions, options.modelOptions);
+      // Allow-list: caller-supplied modelOptions must not clobber the fields
+      // that carry our own budgeting/truncation/tool-wiring decisions.
+      const protectedKeys = new Set(['model', 'messages', 'tools', 'tool_choice', 'stream', 'stream_options']);
+      for (const [key, value] of Object.entries(options.modelOptions)) {
+        if (!protectedKeys.has(key)) {
+          requestOptions[key] = value;
+        }
+      }
     }
 
     // Log request
@@ -1321,6 +1409,12 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       let totalReasoningContent = '';
       let xmlToolBuffer = '';
       let bufferingXmlToolCall = false;
+      // Holds back trailing text that might be an as-yet-unconfirmed prefix
+      // of "<tool_call" split across a stream chunk boundary (see
+      // consumeForXmlToolStart). Tracked separately per source since
+      // reasoning_content and content deltas are distinct text streams.
+      let xmlPendingReasoning = '';
+      let xmlPendingContent = '';
       let totalToolCalls = 0;
       let lastFinishReason: string | undefined;
       let lastUsage: OpenAIUsage | undefined;
@@ -1341,13 +1435,25 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         // Handle reasoning/thinking content from the model
         if (chunk.reasoning_content) {
           totalReasoningContent += chunk.reasoning_content;
-          if (this.config.qwenToolLoopCompat && (chunk.reasoning_content.includes('<tool_call') || bufferingXmlToolCall)) {
+          if (this.config.qwenToolLoopCompat && bufferingXmlToolCall) {
             const buffered = this.appendXmlToolBuffer(xmlToolBuffer, chunk.reasoning_content);
             xmlToolBuffer = buffered.buffer;
             bufferingXmlToolCall = buffered.buffering;
-          } else if (!this.config.qwenToolLoopCompat && typeof (vscode as any).LanguageModelThinkingPart !== 'undefined') {
+          } else if (this.config.qwenToolLoopCompat) {
+            // Reasoning is never shown to the user in compat mode, so only the
+            // tag-start detection matters here — no visible text to flush.
+            const { pending, tagStart } = this.consumeForXmlToolStart(xmlPendingReasoning, chunk.reasoning_content);
+            if (tagStart !== undefined) {
+              const buffered = this.appendXmlToolBuffer(xmlToolBuffer, tagStart);
+              xmlToolBuffer = buffered.buffer;
+              bufferingXmlToolCall = buffered.buffering;
+              xmlPendingReasoning = '';
+            } else {
+              xmlPendingReasoning = pending;
+            }
+          } else if (typeof (vscode as any).LanguageModelThinkingPart !== 'undefined') {
             progress.report(new (vscode as any).LanguageModelThinkingPart(chunk.reasoning_content));
-          } else if (!this.config.qwenToolLoopCompat) {
+          } else {
             // Fallback: wrap reasoning in <think> tags for visibility
             progress.report(new vscode.LanguageModelTextPart(chunk.reasoning_content));
           }
@@ -1360,17 +1466,17 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
             xmlToolBuffer = buffered.buffer;
             bufferingXmlToolCall = buffered.buffering;
           } else if (this.config.qwenToolLoopCompat) {
-            const toolStart = chunk.content.indexOf('<tool_call');
-            if (toolStart === -1) {
-              progress.report(new vscode.LanguageModelTextPart(chunk.content));
-            } else {
-              const visiblePrefix = chunk.content.slice(0, toolStart);
-              if (visiblePrefix) {
-                progress.report(new vscode.LanguageModelTextPart(visiblePrefix));
-              }
-              const buffered = this.appendXmlToolBuffer(xmlToolBuffer, chunk.content.slice(toolStart));
+            const { visible, pending, tagStart } = this.consumeForXmlToolStart(xmlPendingContent, chunk.content);
+            if (visible) {
+              progress.report(new vscode.LanguageModelTextPart(visible));
+            }
+            if (tagStart !== undefined) {
+              const buffered = this.appendXmlToolBuffer(xmlToolBuffer, tagStart);
               xmlToolBuffer = buffered.buffer;
               bufferingXmlToolCall = buffered.buffering;
+              xmlPendingContent = '';
+            } else {
+              xmlPendingContent = pending;
             }
           } else {
             progress.report(new vscode.LanguageModelTextPart(chunk.content));
@@ -1392,6 +1498,14 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       // another upstream request — for a conversation the user abandoned.
       if (token.isCancellationRequested) {
         throw new GatewayError('Chat completion cancelled', undefined, false);
+      }
+
+      // Any content still held back as a possible "<tool_call" tag prefix
+      // never got confirmed by end of stream — it wasn't a tag after all, so
+      // flush it now as ordinary visible text.
+      if (this.config.qwenToolLoopCompat && xmlPendingContent) {
+        progress.report(new vscode.LanguageModelTextPart(xmlPendingContent));
+        xmlPendingContent = '';
       }
 
       if (this.config.qwenToolLoopCompat) {
@@ -1468,7 +1582,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
           const hasToolResults = openAIMessages.some((message) => message.role === 'tool');
           if (this.config.finalAnswerRetry || (hasToolResults && this.config.qwenToolLoopCompat && this.config.qwenFinalAnswerRetry)) {
-            const retried = await this.retryQwenFinalAnswer(requestOptions, truncatedMessages, totalReasoningContent, modelMaxContext, progress, token);
+            const retried = await this.retryQwenFinalAnswer(requestOptions, truncatedMessages, totalReasoningContent, modelMaxContext, progress, token, model.id);
             if (retried) {
               return;
             }
