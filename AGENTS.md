@@ -66,15 +66,17 @@ streams the completion back through `client.streamChatCompletion()`, and reports
 | File | Role | Notes |
 |------|------|-------|
 | `src/extension.ts` | Activation, command registration (setApiKey, showStatus, selectModel, switchServer, showStats, refreshModels), status bar wiring | Commands call into `provider` / `statusBar` / `statsManager`. Preset switching updates config then calls `provider.applyLatestConfiguration()` + `clearModelCache()`. `selectModel` is browse-only (models in server order — the `defaultModel` setting was removed in 1.2.10). Activation runs a one-time cleanup that deletes any leftover `defaultModel` value from user/workspace settings.json. |
-| `src/provider.ts` | **Core.** `GatewayProvider implements vscode.LanguageModelChatProvider` | Message conversion, token estimation/truncation, tool-call handling (incl. JSON repair), Qwen XML tool-call compat, vision detection + image forwarding, reasoning salvage + final-answer retry, model caching. |
+| `src/provider.ts` | **Core.** `GatewayProvider implements vscode.LanguageModelChatProvider` | Message conversion, token estimation/truncation, tool-call handling (incl. JSON repair), Qwen XML tool-call compat, vision detection + image forwarding, reasoning salvage + final-answer retry (`retryFinalAnswer`), model caching. |
 | `src/client.ts` | `GatewayClient`: HTTP with retry/backoff/jitter, SSE streaming parser for `/v1/chat/completions`, `/v1/models` fetch, Ollama `/api/tags` capability probe | Yields chunks `{ content, reasoning_content?, tool_calls, finished_tool_calls, finish_reason?, usage? }`. Tool calls accumulate **by index** during streaming (ids may arrive late). Injects `stream_options: { include_usage: true }` when `includeUsageInStream` is set; the trailing usage chunk arrives with an **empty `choices` array**, so `parseSSEData` must capture `usage` independently of delta/message. `fetch`/`fetchWithRetry` accept a `CancellationToken` and abort the request on cancel (TCP teardown); `sleepCancellable` short-circuits retry backoff. **`isRetryableError` walks the `error.cause` chain and checks `error.code`** so Node's `TypeError: fetch failed` (with `ECONNREFUSED`/`ETIMEDOUT`/`ECONNRESET` nested in `cause`) is retried. **`readWithIdleTimeout`** races each stream read against `requestTimeout` so a server that stalls mid-stream (after headers) is aborted with a retryable `GatewayError` instead of hanging. **`extractContextLength(model)`** (static) parses a model's effective context window from llama.cpp `status.args` (`--override-kv ...context_length=int:<n>` wins over `--ctx-size <n>`); returns `undefined` when absent so callers fall back to a built-in `FALLBACK_CONTEXT_WINDOW` (no `defaultMaxTokens` setting anymore). **`sanitizeLoneSurrogates()`** (module-level function) is applied via the `JSON.stringify(body, replacer)` replacer in `streamChatCompletion` — it replaces any unpaired UTF-16 surrogate half in outgoing string values with U+FFFD before the request body is serialized. This is the single choke point for the outgoing HTTP body; keep it if you ever add a second request-building path. |
 | `src/types.ts` | All shared interfaces: `OpenAIModel`, `OpenAIMessage`, request/response/chunk types, `OllamaModelCapabilities`, `GatewayConfig` | Keep in sync with what `client.ts` sends/reads and what `loadConfig()` fills. `OpenAIModel` carries optional `status.args` (llama.cpp launch args) and `contextLength` (parsed effective context window). |
 | `src/secrets.ts` | `SecretManager`: API key in `vscode.SecretStorage` (key: `local.model.provider.apiKey`), legacy settings migration | Never log the key. |
 | `src/statusBar.ts` | Status bar item (`$(plug)/$(check)/$(error)` "Local LLM"), quick-pick status menu, server presets UI types (`ServerPreset`, `ServerStatus`) | |
 | `src/statistics.ts` | In-memory per-session request stats + `onStatsUpdate` event feeding the status bar | `formatTokens`/`formatDuration` are static helpers used by `extension.ts`. |
-| `src/qwenXml.ts` | Pure function `parseQwenXmlToolCalls()` — parses Qwen's raw XML tool-call format (`<tool_call> <function=...> <parameter=...>`) into structured calls; the only unit-tested module | Keep it dependency-free (no vscode import) so `tsconfig.test.json` can compile it standalone. The caller (`provider.ts`) is responsible for reassembling a `<tool_call` opening tag that streamed split across two SSE chunks BEFORE handing text to this parser — see `consumeForXmlToolStart`/`appendXmlToolBuffer`. |
+| `src/qwenXml.ts` | Pure function `parseQwenXmlToolCalls()` — parses Qwen's raw XML tool-call format (`<tool_call> <function=...> <parameter=...>`) into structured calls; unit-tested | **Tag-aware scanner, not lazy regexes.** A lazy `[\s\S]*?<\/parameter>` match stops at the FIRST closing tag, so a parameter value containing the literal text `</parameter>` (code snippets, strings) was silently truncated. `extractParameters()` matches each `<parameter=` open tag to the LAST `</parameter>` before the next `<parameter=`/`</function>` boundary; `coerceParameterValue()` applies the int/float/bool/JSON coercion. Keep it dependency-free (no vscode import) so `tsconfig.test.json` can compile it standalone. The caller (`provider.ts`) is responsible for reassembling a `<tool_call` opening tag that streamed split across two SSE chunks BEFORE handing text to this parser — see `consumeForXmlToolStart`/`appendXmlToolBuffer`. |
+| `src/charUtils.ts` | `truncateToCodePoints()` — truncates a string by Unicode code points so a UTF-16 `.slice(0, n)` can never split a surrogate pair (used by `retryFinalAnswer`'s reasoning budget) | Dependency-free (no vscode import) so `tsconfig.test.json` can compile it standalone. If you add more pure string helpers, put them here so they stay unit-testable. |
 | `src/crashLog.ts` | `buildCrashReport()` + `writeCrashReport()` — writes a "how did I get here" snapshot to `context.globalStorageUri` whenever a chat request fails, and returns the file path so `handleChatError` can surface it to the user | Redacts API keys / bearer tokens / base64 image payloads before writing. Never let logging itself break the user-facing error path (wrapped in try/catch). |
 | `test/qwenXml.test.ts` | Plain Node test runner for `qwenXml` (no framework) | Run via `npm test`. |
+| `test/charHandling.test.ts` | Plain Node test runner for the character-handling fixes: `qwenXml` embedded-tag parsing, `truncateToCodePoints`, surrogate sanitization, string-aware JSON repair (no framework) | Run via `npm test`. **`npm test` runs BEFORE every build** — `prebuild`/`prepackage` hooks in `package.json` invoke it, so a regression fails the build. |
 | `docs/API.md` | Internal architecture docs (partially historical — verify against code before trusting) | |
 | `package.json` | Manifest: contributes commands + all `local.model.provider.*` settings; build scripts. `name` is `local-model-provider-custom` (fork id, coexists with the official extension); `displayName` is "(custom) Local Model Provider" | **Every new setting must be added here AND to `GatewayConfig` + `loadConfig()`.** Contributed command ids follow the `local-model-provider-custom.*` namespace — if you rename the `name` field again, update them in `package.json`, `extension.ts`, and `statusBar.ts` (and the model `family` in `provider.ts`). |
 | `install_build/` | **Portable Windows installer folder** — copy the whole folder to any machine and double-click `install.bat` | Contains `install.bat` (finds VS Code CLI on PATH or in standard install dirs, runs `code --install-extension`), a **bundled `local-model-provider-custom-<version>.vsix`**, and a short `README.md`. The vsix here is the *distributable artifact* — it is git-tracked via the `!install_build/*.vsix` exception in `.gitignore`. **Must be refreshed on every release** (see §6). |
@@ -137,9 +139,12 @@ provideLanguageModelChatResponse(model, messages, options, progress, token)
  │    if no content & no tools:
  │       1) salvage answer after last </thinking>/</think> in reasoning (extractAnswerFromReasoning)
  │       2) else finalAnswerRetry (or legacy qwen gate): one no-tools "give the final answer" request
- │          (retryQwenFinalAnswer budgets the appended reasoning against the context
- │          window so long conversations don't overflow)
- │       3) else fallback message; finish_reason==="length" hints to raise the
+ │          (retryFinalAnswer budgets the appended reasoning against the context
+ │          window so long conversations don't overflow)  │       2b) BEFORE that, if recoverMalformedToolCalls is on and the output
+  │          contains a raw "<tool_call> ... </tool_call>" block with NO structured tool call
+  │          (hasMalformedToolCall), one corrective retry (retryMalformedToolCall)
+  │          tells the model its answer contained a badly formatted tool call and
+  │          to try again and continue the task; its usage is reported/recorded │       3) else fallback message; finish_reason==="length" hints to raise the
  │          upstream server's output limit (not a removed setting)
  └─ record stats, log response time
 ```
@@ -195,7 +200,8 @@ provideLanguageModelChatResponse(model, messages, options, progress, token)
 - **Post-stream work must respect cancellation (1.2.9).** Right after the stream
   loop, if `token.isCancellationRequested`, throw a "…cancelled" `GatewayError` so
   usage reporting, stats, reasoning salvage and the final-answer retry are skipped
-  for abandoned chats (the retry would even fire a NEW upstream request).
+  for abandoned chats (the retry would even fire a NEW upstream request). The
+  malformed-tool-call retry (`retryMalformedToolCall`, 1.2.16) follows the same rule.
 - **Sanitize server `usage` before consuming it (1.2.9).** Servers can send partial
   usage objects; normalize to full OpenAI shape (`sanitizedUsage`: missing fields →
   0 / derived total) before the 'usage' data part and stats, or session stats show
@@ -213,11 +219,17 @@ provideLanguageModelChatResponse(model, messages, options, progress, token)
 ```powershell
 npm install                 # dev deps (esbuild, typescript, @types/vscode, vsce)
 npx tsc -p ./ --noEmit      # type-check (expect exit 0; a pre-existing moduleResolution deprecation warning in tsconfig.json is NOT an error)
-npm test                    # compiles tsconfig.test.json + runs qwenXml tests (plain node, no framework)
-npm run esbuild             # bundle src/extension.ts -> out/extension.js (+sourcemap)
-npm run package             # vsce package -> local-model-provider-custom-<version>.vsix
+npm test                    # compiles tsconfig.test.json + runs qwenXml + charHandling tests (plain node, no framework)
+npm run esbuild             # bundle src/extension.ts -> out/extension.js (+sourcemap); runs `npm test` first via prebuild hook
+npm run package             # vsce package -> local-model-provider-custom-<version>.vsix; runs `npm test` first via prepackage hook
 code --install-extension .\local-model-provider-custom-<version>.vsix   # install into the user's VS Code
 ```
+
+**Tests run before every build.** `package.json` defines `prebuild` and
+`prepackage` hooks that invoke `npm test`, so `npm run esbuild` and
+`npm run package` fail fast if a unit test regresses. If you add a new pure
+helper, add a test to `test/charHandling.test.ts` (or a new `test/*.test.ts`
+file and wire it into the `test` script).
 
 **Release workflow after any code change:**
 1. Bump `version` in `package.json`.
@@ -278,7 +290,24 @@ Notes:
   the final (post-truncation) estimates use `extractEstimableText()`; an inline
   `JSON.stringify(m.content)` on multimodal content would inflate the estimate and collapse
   `max_tokens` to the 64 floor.
-- **`qwenXml.ts` must stay vscode-free** or the standalone test compile breaks.
+- **`qwenXml.ts` and `charUtils.ts` must stay vscode-free** or the standalone test compile breaks.
+- **Qwen XML parameter values can contain literal `</parameter>` text** (code snippets,
+  strings). The parser matches each `<parameter=` open tag to the LAST `</parameter>`
+  before the next `<parameter=`/`</function>` boundary — do NOT revert to a lazy
+  `[\s\S]*?<\/parameter>` regex, which truncates at the first closing tag and silently
+  corrupts tool-call arguments.
+- **Never truncate strings with UTF-16 `.slice(0, n)`** — it can split a surrogate
+  pair (emoji) in half. Use `truncateToCodePoints()` from `charUtils.ts` (see
+  `retryFinalAnswer`'s reasoning budget). The outgoing `sanitizeLoneSurrogates`
+  replacer in `client.ts` is the last line of defense, but it replaces the orphaned
+  half with U+FFFD — a mangled character, not a clean truncation.
+- **The SSE decoder is `fatal: true`** (`client.ts`): invalid UTF-8 in the stream
+  throws a retryable `GatewayError` instead of silently replacing bytes with U+FFFD.
+  Do not revert to a non-fatal decoder — silent replacement feeds mangled text to the
+  user with no error, no warning, and no retry.
+- **JSON repair is string-aware** (`provider.ts`): `balanceBrackets`/`removeTrailingCommas`
+  ignore brackets/braces/commas inside string literals, so `{"path": "a]b"}` is not
+  mis-repaired. Do not revert to naive `countChar`-based balancing.
 - **Extension id is `krevas.local-model-provider-custom` (1.2.0+), NOT the official
   `krevas.local-model-provider`.** The fork deliberately coexists with the marketplace
   version; command ids are `local-model-provider-custom.*`. If you ever rename the
@@ -299,7 +328,7 @@ Notes:
   well-formed JSON *text*. Lone surrogates can appear from mangled chat input
   (clipboard/IME edge cases with ZWJ emoji sequences) or from any future
   char-index string truncation that happens to land inside a surrogate pair
-  (e.g. `retryQwenFinalAnswer`'s `reasoningChars.slice(0, maxReasoningChars)`
+  (e.g. `retryFinalAnswer`'s `reasoningChars.slice(0, maxReasoningChars)`
   in `provider.ts`, which is UTF-16-code-unit based, not code-point based).
   Fixed by sanitizing at the single point the wire body is produced:
   `client.ts` `streamChatCompletion` now serializes with
@@ -325,7 +354,8 @@ Notes:
 ## 8. Change checklist (do ALL that apply per change)
 
 - [ ] Code change compiles: `npx tsc -p ./ --noEmit` → exit 0
-- [ ] Tests pass: `npm test`
+- [ ] Tests pass: `npm test` (runs automatically before `esbuild`/`package` via `prebuild`/`prepackage` hooks)
+- [ ] New pure string/parsing helper? → put it in `charUtils.ts`/`qwenXml.ts` (vscode-free) and add tests to `test/charHandling.test.ts` (or a new `test/*.test.ts` wired into the `test` script)
 - [ ] New/changed setting? → `package.json` + `GatewayConfig` + `loadConfig()` (3 places). Never reintroduce the removed `defaultMaxTokens`/`defaultMaxOutputTokens` settings — use the `FALLBACK_CONTEXT_WINDOW`/`DEFAULT_MAX_OUTPUT_TOKENS` constants and the `maxOutputTokens` setting in `provider.ts`
 - [ ] New server-side behavior? → extend `client.ts` (+ `types.ts`), keep retry/compat rules
 - [ ] Model capability change? → update `detectVision`; per-model `extractContextLength` + `splitContextWindow` (input+output must sum to real n_ctx); request path uses `getModelContextWindow()` not `maxInputTokens` alone

@@ -4,6 +4,7 @@ import { GatewayConfig, OpenAIChatCompletionRequest, OpenAIUsage, OllamaModelCap
 import { SecretManager } from './secrets';
 import { StatisticsManager } from './statistics';
 import { parseQwenXmlToolCalls } from './qwenXml';
+import { truncateToCodePoints } from './charUtils';
 import { buildCrashReport, writeCrashReport } from './crashLog';
 
 // The authoritative context window for every model now comes from the server
@@ -485,27 +486,44 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   }
 
   /**
-   * Count occurrences of a character in a string
+   * Count occurrences of a character in a string, ignoring characters inside
+   * JSON string literals. Used by the JSON repair path so brackets/braces that
+   * are part of a string VALUE (e.g. `{"path": "a]b"}`) are not counted as
+   * structural brackets.
    */
-  private countChar(str: string, char: string): number {
-    // Escape regex special characters in the search char
-    const escapePattern = /[.*+?^${}()|[\]\\]/g;
-    const escapedChar = char.replaceAll(escapePattern, String.raw`\$&`);
-    const regex = new RegExp(escapedChar, 'g');
+  private countCharOutsideStrings(str: string, char: string): number {
     let count = 0;
-    while (regex.exec(str) !== null) {
-      count++;
+    let inString = false;
+    let escaped = false;
+    for (let i = 0; i < str.length; i++) {
+      const c = str[i];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (c === '\\') {
+          escaped = true;
+        } else if (c === '"') {
+          inString = false;
+        }
+        continue;
+      }
+      if (c === '"') {
+        inString = true;
+      } else if (c === char) {
+        count++;
+      }
     }
     return count;
   }
 
   /**
-   * Balance unclosed braces/brackets in a JSON string
+   * Balance unclosed braces/brackets in a JSON string, ignoring brackets that
+   * appear inside string literals (a `]` inside `"a]b"` is data, not structure).
    */
   private balanceBrackets(str: string): string {
     let result = str;
-    const missingBrackets = this.countChar(result, '[') - this.countChar(result, ']');
-    const missingBraces = this.countChar(result, '{') - this.countChar(result, '}');
+    const missingBrackets = this.countCharOutsideStrings(result, '[') - this.countCharOutsideStrings(result, ']');
+    const missingBraces = this.countCharOutsideStrings(result, '{') - this.countCharOutsideStrings(result, '}');
 
     result += ']'.repeat(Math.max(0, missingBrackets));
     result += '}'.repeat(Math.max(0, missingBraces));
@@ -531,14 +549,18 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     // Attempt repairs for common issues
     let repaired = jsonStr.trim();
 
-    // Fix missing closing brackets/braces
+    // Fix missing closing brackets/braces (string-aware: brackets inside
+    // string literals are data, not structure)
     repaired = this.balanceBrackets(repaired);
 
-    // Fix trailing comma before closing brace/bracket
-    repaired = repaired.replaceAll(/,\s*([}\]])/g, '$1');
+    // Fix trailing comma before closing brace/bracket. Only strip a comma that
+    // is followed by a structural closing bracket — a comma inside a string
+    // value is data and must be preserved.
+    repaired = this.removeTrailingCommas(repaired);
 
     // Fix truncated string value - close the string if odd number of quotes
-    if (this.countChar(repaired, '"') % 2 !== 0) {
+    // (counted outside escaped sequences)
+    if (this.countQuotesOutsideEscapes(repaired) % 2 !== 0) {
       repaired += '"';
       repaired = this.balanceBrackets(repaired);
     }
@@ -550,6 +572,69 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       this.outputChannel.appendLine(`Repaired attempt: ${repaired}`);
       return null;
     }
+  }
+
+  /**
+   * Count unescaped double-quote characters in a string (used to detect a
+   * truncated string value).
+   */
+  private countQuotesOutsideEscapes(str: string): number {
+    let count = 0;
+    let escaped = false;
+    for (let i = 0; i < str.length; i++) {
+      const c = str[i];
+      if (escaped) {
+        escaped = false;
+      } else if (c === '\\') {
+        escaped = true;
+      } else if (c === '"') {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * Remove a trailing comma that appears immediately before a structural
+   * closing bracket/brace, but only when that comma is OUTSIDE a string
+   * literal. A comma inside a string value (e.g. `{"a": "x,y]"}`) is data.
+   */
+  private removeTrailingCommas(str: string): string {
+    let result = '';
+    let inString = false;
+    let escaped = false;
+    for (let i = 0; i < str.length; i++) {
+      const c = str[i];
+      if (inString) {
+        result += c;
+        if (escaped) {
+          escaped = false;
+        } else if (c === '\\') {
+          escaped = true;
+        } else if (c === '"') {
+          inString = false;
+        }
+        continue;
+      }
+      if (c === '"') {
+        inString = true;
+        result += c;
+        continue;
+      }
+      // Outside a string: drop a comma that is directly followed by a
+      // structural closing bracket/brace (possibly with whitespace between).
+      if (c === ',') {
+        let j = i + 1;
+        while (j < str.length && /\s/.test(str[j])) {
+          j++;
+        }
+        if (j < str.length && (str[j] === ']' || str[j] === '}')) {
+          continue; // drop the trailing comma
+        }
+      }
+      result += c;
+    }
+    return result;
   }
 
   /**
@@ -1080,10 +1165,10 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   }
 
   /**
-   * Qwen can return only reasoning after a tool result. Do one no-tools
-   * finalization pass so VS Code receives normal assistant content.
+   * A server may return only reasoning (no final assistant content). Do one
+   * no-tools finalization pass so VS Code receives normal assistant content.
    */
-  private async retryQwenFinalAnswer(
+  private async retryFinalAnswer(
     baseRequestOptions: Record<string, unknown>,
     messages: Record<string, unknown>[],
     reasoningContent: string,
@@ -1109,9 +1194,14 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       const reasoningChars = reasoningContent.trim();
       // ~4 chars per token; keep a small margin.
       const maxReasoningChars = reasoningBudget * 4;
-      const trimmedReasoning = reasoningChars.length > maxReasoningChars
-        ? reasoningChars.slice(0, maxReasoningChars)
-        : reasoningChars;
+            // Truncate by CODE POINTS, not UTF-16 code units: a raw `.slice(0, n)`
+            // can land inside a surrogate pair and split an emoji in half. The
+            // outgoing sanitizer would replace the orphaned half with U+FFFD, so the
+            // retry request would silently carry a mangled character. Truncating on
+            // code points keeps the reasoning transcript intact.
+            const trimmedReasoning = reasoningChars.length > maxReasoningChars
+              ? truncateToCodePoints(reasoningChars, maxReasoningChars)
+              : reasoningChars;
       // Reassign so the push below uses the context-budgeted reasoning.
       reasoningContent = trimmedReasoning;
       finalMessages.push({
@@ -1140,7 +1230,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     let retryReasoningLength = 0;
     let retryUsage: OpenAIUsage | undefined;
     const retryStartTime = Date.now();
-    this.log('info', 'Qwen tool-loop compatibility: running final-answer retry without tools.');
+    this.log('info', 'Running final-answer retry without tools.');
 
     for await (const chunk of this.client.streamChatCompletion(retryOptions as unknown as OpenAIChatCompletionRequest, token)) {
       if (token.isCancellationRequested) {
@@ -1158,7 +1248,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       }
     }
 
-    this.log('info', `Qwen final-answer retry produced ${contentLength} content characters, ${retryReasoningLength} reasoning characters.`);
+    this.log('info', `Final-answer retry produced ${contentLength} content characters, ${retryReasoningLength} reasoning characters.`);
 
     // The retry is a whole extra upstream request; without this, its token
     // cost was invisible to both VS Code's context-window meter and session
@@ -1187,6 +1277,107 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       });
     }
 
+    return contentLength > 0;
+  }
+
+  /**
+   * Detect a malformed tool call: the model wrote a raw "<tool_call> ... </tool_call>"
+   * block as plain text instead of emitting a structured tool call. Only
+   * counts when NO structured tool call was produced — otherwise a model that
+   * legitimately discusses tool-call syntax in its answer would trigger a
+   * pointless retry.
+   */
+  private hasMalformedToolCall(totalContent: string, totalReasoningContent: string, totalToolCalls: number): boolean {
+    if (totalToolCalls > 0) {
+      return false;
+    }
+    const openTag = '<tool_call>';
+    const closeTag = '</tool_call>';
+    const hasRawMarkup = (text: string) => text.includes(openTag) && text.includes(closeTag);
+    return hasRawMarkup(totalContent) || hasRawMarkup(totalReasoningContent);
+  }
+
+  /**
+   * The model emitted a raw "<tool_call> ... </tool_call>" block as plain text (a malformed
+   * tool call). Send one corrective request telling it to retry with a proper
+   * tool call and continue the task. Returns true when the retry produced
+   * visible content.
+   */
+  private async retryMalformedToolCall(
+    baseRequestOptions: Record<string, unknown>,
+    messages: Record<string, unknown>[],
+    malformedText: string,
+    progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+    token: vscode.CancellationToken,
+    modelId: string
+  ): Promise<boolean> {
+    const correctiveMessages = [
+      ...messages,
+      { role: 'assistant', content: malformedText },
+      {
+        role: 'user',
+        content: 'Your answer contained a badly formatted tool call: you wrote a raw "<tool_call> ... </tool_call>" block as plain text instead of emitting a structured tool call. Try again and continue with your task, using the proper tool-call format.',
+      },
+    ];
+
+    const retryOptions: Record<string, unknown> = {
+      ...baseRequestOptions,
+      messages: correctiveMessages,
+      max_tokens: Number(baseRequestOptions.max_tokens) || this.config.maxOutputTokens || DEFAULT_MAX_OUTPUT_TOKENS,
+    };
+
+    let contentLength = 0;
+    let retryUsage: OpenAIUsage | undefined;
+    const retryStartTime = Date.now();
+    this.log('warn', 'Detected malformed (raw XML) tool call in model output; running corrective retry.');
+
+    for await (const chunk of this.client.streamChatCompletion(retryOptions as unknown as OpenAIChatCompletionRequest, token)) {
+      if (token.isCancellationRequested) {
+        break;
+      }
+      if (chunk.usage) {
+        retryUsage = chunk.usage;
+      }
+      if (chunk.finished_tool_calls?.length) {
+        for (const toolCall of chunk.finished_tool_calls) {
+          this.processToolCall(toolCall, progress, '');
+        }
+      }
+      if (chunk.content) {
+        contentLength += chunk.content.length;
+        progress.report(new vscode.LanguageModelTextPart(chunk.content));
+      }
+    }
+
+    if (token.isCancellationRequested) {
+      throw new GatewayError('Chat completion cancelled', undefined, false);
+    }
+
+    const sanitizedRetryUsage: OpenAIUsage | undefined = retryUsage
+      ? {
+          prompt_tokens: typeof retryUsage.prompt_tokens === 'number' ? retryUsage.prompt_tokens : 0,
+          completion_tokens: typeof retryUsage.completion_tokens === 'number' ? retryUsage.completion_tokens : 0,
+          total_tokens: typeof retryUsage.total_tokens === 'number'
+            ? retryUsage.total_tokens
+            : (retryUsage.prompt_tokens ?? 0) + (retryUsage.completion_tokens ?? 0),
+        }
+      : undefined;
+    if (sanitizedRetryUsage && typeof (vscode as any).LanguageModelDataPart !== 'undefined') {
+      progress.report(new (vscode as any).LanguageModelDataPart(
+        new TextEncoder().encode(JSON.stringify(sanitizedRetryUsage)),
+        'usage',
+      ));
+    }
+    if (this.statsManager) {
+      this.statsManager.recordRequest({
+        modelId,
+        inputTokens: sanitizedRetryUsage?.prompt_tokens ?? 0,
+        outputTokens: sanitizedRetryUsage?.completion_tokens ?? Math.ceil(contentLength / 4),
+        responseTimeMs: Date.now() - retryStartTime,
+      });
+    }
+
+    this.log('info', `Malformed-tool-call retry produced ${contentLength} content characters.`);
     return contentLength > 0;
   }
 
@@ -1568,6 +1759,20 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       }
       this.log('info', `Response time: ${responseTimeMs}ms, Input tokens: ${sanitizedUsage ? inputTokens : `~${estimatedInputTokens}`}, Output tokens: ${sanitizedUsage && sanitizedUsage.completion_tokens > 0 ? outputTokens : `~${outputTokens}`}`);
 
+      // Malformed tool-call recovery: the model wrote a raw "<tool_call> ... </tool_call>"
+      // block as plain text instead of a structured tool call. Send one
+      // corrective request telling it to retry and continue the task.
+      if (this.config.recoverMalformedToolCalls && this.hasMalformedToolCall(totalContent, totalReasoningContent, totalToolCalls)) {
+        const malformedText = totalContent.includes('<tool_call>') ? totalContent : totalReasoningContent;
+        const retried = await this.retryMalformedToolCall(requestOptions, truncatedMessages, malformedText, progress, token, model.id);
+        if (retried) {
+          return;
+        }
+        // Retry produced nothing — fall through to the normal empty-response
+        // handling below so the user still gets a diagnostic message.
+        this.log('warn', 'Malformed-tool-call retry produced no content; falling back to standard handling.');
+      }
+
       if (totalContent.length === 0 && totalToolCalls === 0) {
         if (totalReasoningContent.length > 0) {
           // Some servers (notably Ollama with certain thinking models) emit the
@@ -1581,8 +1786,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
           }
 
           const hasToolResults = openAIMessages.some((message) => message.role === 'tool');
-          if (this.config.finalAnswerRetry || (hasToolResults && this.config.qwenToolLoopCompat && this.config.qwenFinalAnswerRetry)) {
-            const retried = await this.retryQwenFinalAnswer(requestOptions, truncatedMessages, totalReasoningContent, modelMaxContext, progress, token, model.id);
+          if (this.config.finalAnswerRetry) {
+            const retried = await this.retryFinalAnswer(requestOptions, truncatedMessages, totalReasoningContent, modelMaxContext, progress, token, model.id);
             if (retried) {
               return;
             }
@@ -1688,8 +1893,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       enableToolCalling: config.get<boolean>('enableToolCalling', true),
       parallelToolCalling: config.get<boolean>('parallelToolCalling', true),
       qwenToolLoopCompat: config.get<boolean>('qwenToolLoopCompat', false),
-      qwenFinalAnswerRetry: config.get<boolean>('qwenFinalAnswerRetry', true),
       finalAnswerRetry: config.get<boolean>('finalAnswerRetry', true),
+      recoverMalformedToolCalls: config.get<boolean>('recoverMalformedToolCalls', true),
       includeUsageInStream: config.get<boolean>('includeUsageInStream', true),
       maxRetries: config.get<number>('maxRetries', 3),
       retryDelayMs: config.get<number>('retryDelayMs', 1000),

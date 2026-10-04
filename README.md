@@ -156,7 +156,7 @@ starves the input side. The server's own max-output limit governs generation len
 - `enableToolCalling` (boolean): enable function calling (default true)
 - `parallelToolCalling` (boolean): allow parallel tool calls (default true)
 - `qwenToolLoopCompat` (boolean): enable Qwen-specific compatibility for XML-style tool calls and reasoning-only post-tool responses (default false)
-- `qwenFinalAnswerRetry` (boolean): when Qwen compatibility is enabled, run one no-tools final-answer retry after reasoning-only tool responses (default true)
+- `finalAnswerRetry` (boolean): when the model returns reasoning but no final answer (common with thinking models on vision or long requests), run one extra no-tools final-answer retry (default true)
 
 > Sampling parameters (temperature, top‑p, frequency/presence penalties) are intentionally **not** exposed: the extension never sends them, so your server's own defaults (e.g. llama.cpp's) always apply.
 

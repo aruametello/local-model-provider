@@ -1,6 +1,27 @@
 # Changelog
 
+## 1.2.17
+
+### Bug Fixes
+- **Qwen XML tool-call parsing is now tag-aware.** Parameter values containing the literal text `</parameter>` (code snippets, strings) were silently truncated at the first closing tag by the lazy `[\s\S]*?<\/parameter>` regex, corrupting tool-call arguments. `parseQwenXmlToolCalls()` now uses `extractParameters()`/`coerceParameterValue()` to match each `<parameter=` open tag to the last `</parameter>` before the next `<parameter=`/`</function>` boundary.
+- **Invalid UTF-8 in the SSE stream now fails loudly instead of silently mangling output.** The stream decoder is `new TextDecoder('utf-8', { fatal: true })`, so malformed bytes throw a retryable `GatewayError` instead of being replaced with U+FFFD and fed to the user with no error, no warning, and no retry.
+- **Reasoning-budget truncation is now code-point-safe.** `retryFinalAnswer`'s reasoning truncation uses `truncateToCodePoints()` (new `src/charUtils.ts`) instead of UTF-16 `.slice(0, n)`, so a surrogate pair (emoji) landing on the boundary is never split in half.
+- **JSON repair is now string-aware.** `balanceBrackets`/`removeTrailingCommas` and the quote-counting logic ignore brackets, braces, and commas inside string literals, so values like `{"path": "a]b"}` are no longer mis-repaired.
+
+## 1.2.16
+
+### New Features
+- **Recovery from malformed tool calls (`recoverMalformedToolCalls`, default on).** Some models write a raw `<tool_call> ... </tool_call>` block as plain text instead of emitting a structured tool call, so the request silently does nothing. When the streamed output contains that markup and no structured tool call was produced, the extension now sends one corrective request telling the model its answer contained a badly formatted tool call and to try again and continue the task. The retry's token usage is reported to VS Code and recorded in session stats; cancellations during the retry are swallowed silently like the main path.
+
+## 1.2.15
+
+### Removed
+- **Removed the redundant `qwenFinalAnswerRetry` setting.** It was fully subsumed by `finalAnswerRetry` (the decision point was `finalAnswerRetry || (hasToolResults && qwenToolLoopCompat && qwenFinalAnswerRetry)`, so with the general retry on — the default — the Qwen flag was never evaluated). The single final-answer retry path now keys off `finalAnswerRetry` alone. The method `retryQwenFinalAnswer()` was renamed to `retryFinalAnswer()` to reflect that it is no longer Qwen-specific.
+
 ## 1.2.14
+
+### Removed
+- **Removed the redundant `qwenFinalAnswerRetry` setting.** It was fully subsumed by `finalAnswerRetry` (the decision point is `finalAnswerRetry || (hasToolResults && qwenToolLoopCompat && qwenFinalAnswerRetry)`, so with the general retry on — the default — the Qwen flag was never evaluated). The single final-answer retry path now keys off `finalAnswerRetry` alone. The method `retryQwenFinalAnswer()` was renamed to `retryFinalAnswer()` to reflect that it is no longer Qwen-specific.
 
 ### Bug Fixes
 - **Qwen XML tool-call tag detection no longer breaks when `<tool_call` splits across stream chunks.** Token-by-token streaming can split the opening tag across two SSE chunks (e.g. `"<tool_c"` then `"all>..."`); previously this either leaked raw XML into the visible chat response or silently dropped the tool call entirely (in the reasoning-content path). Detection now holds back an unconfirmed tag-prefix suffix across chunk boundaries (`consumeForXmlToolStart`) instead of deciding per-chunk.

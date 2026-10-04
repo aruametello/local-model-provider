@@ -2,7 +2,7 @@
   "name": "local-model-provider-custom",
   "displayName": "(custom) Local Model Provider",
   "description": "VS Code extension to connect to local LLM inference servers (Ollama, llama.cpp, LocalAI, LM Studio, vLLM) via OpenAI API compatible endpoints.",
-  "version": "1.2.14",
+  "version": "1.2.17",
   "publisher": "krevas",
   "icon": "assets/local-model-provider.png",
   "private": true,
@@ -19,12 +19,15 @@
     "esbuild-base": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --target=es2020",
     "esbuild": "npm run esbuild-base -- --sourcemap",
     "esbuild-watch": "npm run esbuild-base -- --sourcemap --watch",
-    "test": "tsc -p tsconfig.test.json && node out-test/test/qwenXml.test.js",
+        "test": "tsc -p tsconfig.test.json && node out-test/test/qwenXml.test.js && node out-test/test/charHandling.test.js",
     "test-qwen": "tsc -p tsconfig.test.json && node out-test/test/qwenXml.test.js",
-    "test-compile": "tsc -p ./",
-    "deploy": "vsce publish --no-yarn",
-    "package": "vsce package --no-yarn"
-  },
+        "test-char": "tsc -p tsconfig.test.json && node out-test/test/charHandling.test.js",
+        "test-compile": "tsc -p ./",
+        "prebuild": "npm test",
+        "prepackage": "npm test",
+        "deploy": "vsce publish --no-yarn",
+        "package": "vsce package --no-yarn"
+      },
   "categories": [
     "AI",
     "Machine Learning",
@@ -144,10 +147,10 @@
           "description": "Enable Qwen-specific tool loop compatibility: preserve reasoning across tool calls and add post-tool final-answer guidance.",
           "order": 8
         },
-        "local.model.provider.qwenFinalAnswerRetry": {
+        "local.model.provider.recoverMalformedToolCalls": {
           "type": "boolean",
           "default": true,
-          "description": "When Qwen tool loop compatibility is enabled, run one internal no-tools final-answer retry if Qwen returns only reasoning after a tool result. (Superseded by 'finalAnswerRetry' for general use.)",
+          "description": "Try to recover from malformed tool calls: when the model writes a raw \"<tool_call> ... \" block as plain text instead of a structured tool call, send a corrective message asking it to retry and continue the task.",
           "order": 9
         },
         "local.model.provider.finalAnswerRetry": {

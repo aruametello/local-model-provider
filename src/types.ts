@@ -117,8 +117,10 @@ export interface GatewayConfig {
   enableToolCalling: boolean;
   parallelToolCalling: boolean;
   qwenToolLoopCompat: boolean;
-  qwenFinalAnswerRetry: boolean;
   finalAnswerRetry: boolean;
+  // Detect raw "<tool_call>"/"</tool_call>" markup leaked into visible content (a malformed tool
+  // call the model wrote as plain text) and retry with a corrective message.
+  recoverMalformedToolCalls: boolean;
   includeUsageInStream: boolean;
   maxRetries: number;
   retryDelayMs: number;

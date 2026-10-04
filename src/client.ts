@@ -706,9 +706,13 @@ export class GatewayClient {
       }
 
       // Use plain TextDecoder for maximum compatibility across runtimes
-      // (TextDecoderStream + pipeThrough can cause "terminated" errors in some environments)
+      // (TextDecoderStream + pipeThrough can cause "terminated" errors in some environments).
+      // `fatal: true` makes invalid UTF-8 in the stream throw a TypeError instead of
+      // silently replacing the offending bytes with U+FFFD — silent replacement would
+      // feed mangled text to the user with no error, no warning, and no retry. The
+      // decode error is caught below and surfaced as a retryable GatewayError.
       const reader = response.body.getReader();
-      const decoder = new TextDecoder('utf-8');
+      const decoder = new TextDecoder('utf-8', { fatal: true });
       let buffer = '';
       let receivedAnyData = false;
 
@@ -743,7 +747,21 @@ export class GatewayClient {
         const { done, value } = readResult;
         if (done) { break; }
 
-        buffer += decoder.decode(value, { stream: true });
+        try {
+          buffer += decoder.decode(value, { stream: true });
+        } catch (decodeError) {
+          // Invalid UTF-8 in the stream: surface it as a retryable error instead
+          // of silently corrupting the model's output with U+FFFD replacement
+          // characters. The retry machinery in fetchWithRetry does not cover
+          // mid-stream decode failures, so this propagates to the provider's
+          // error handler as a normal (retryable-classified) GatewayError.
+          throw new GatewayError(
+            `Chat completion stream contained invalid UTF-8: ${decodeError instanceof Error ? decodeError.message : String(decodeError)}`,
+            undefined,
+            true,
+            decodeError instanceof Error ? decodeError : undefined
+          );
+        }
         receivedAnyData = true;
 
         // Split on \n and also handle \r\n (some servers use Windows-style line endings)
@@ -757,7 +775,16 @@ export class GatewayClient {
       }
 
       // Flush decoder
-      buffer += decoder.decode();
+      try {
+        buffer += decoder.decode();
+      } catch (decodeError) {
+        throw new GatewayError(
+          `Chat completion stream contained invalid UTF-8: ${decodeError instanceof Error ? decodeError.message : String(decodeError)}`,
+          undefined,
+          true,
+          decodeError instanceof Error ? decodeError : undefined
+        );
+      }
 
       // Process remaining buffer content
       if (buffer.trim()) {

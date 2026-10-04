@@ -7,6 +7,7 @@
   },
   "include": [
     "src/qwenXml.ts",
-    "test/**/*.ts"
-  ]
+      "src/charUtils.ts",
+      "test/**/*.ts"
+    ]
 }
