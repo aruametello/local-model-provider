@@ -49,48 +49,6 @@ export function activate(context: vscode.ExtensionContext) {
     void config.update('defaultModel', undefined, vscode.ConfigurationTarget.Workspace);
   }
 
-  // Register command to set API key securely
-  const setApiKeyCommand = vscode.commands.registerCommand(
-    'local-model-provider-custom.setApiKey',
-    async () => {
-      const secretManager = provider.getSecretManager();
-      const hasExisting = await secretManager.hasApiKey();
-      
-      const placeholder = hasExisting 
-        ? 'Enter new API key (leave empty to remove current key)'
-        : 'Enter your API key for the inference server';
-
-      const apiKey = await vscode.window.showInputBox({
-        prompt: placeholder,
-        password: true,
-        placeHolder: 'sk-...',
-        ignoreFocusOut: true,
-      });
-
-      if (apiKey === undefined) {
-        return; // User cancelled
-      }
-
-      try {
-        await secretManager.setApiKey(apiKey);
-        // Apply the updated key to the running client immediately
-        await provider.refreshApiKey();
-        if (apiKey) {
-          vscode.window.showInformationMessage(
-            'Local Model Provider: API key stored securely.'
-          );
-        } else {
-          vscode.window.showInformationMessage(
-            'Local Model Provider: API key removed.'
-          );
-        }
-      } catch (error) {
-        vscode.window.showErrorMessage(
-          `Local Model Provider: Failed to store API key. ${error instanceof Error ? error.message : String(error)}`
-        );
-      }
-    }
-  );
 
   // Register command to show status menu
   const showStatusCommand = vscode.commands.registerCommand(
@@ -446,7 +404,6 @@ export function activate(context: vscode.ExtensionContext) {
     }
   );
 
-  context.subscriptions.push(setApiKeyCommand);
   context.subscriptions.push(showStatusCommand);
   context.subscriptions.push(selectModelCommand);
   context.subscriptions.push(switchServerCommand);

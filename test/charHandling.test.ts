@@ -353,4 +353,32 @@ function hasUnpairedSurrogate(text: string): boolean {
   assert.equal(containsToolCallOpenMarker('x < tool'), false);
 }
 
+// Nested/mentioned markers: prose (e.g. a reasoning trace) that MENTIONS
+// <function=name> or <tool_call> must not hijack the real call that follows.
+{
+  const real = '<tool_call>\n<function=powershell>\n<parameter=command>\ncd x\n</parameter>\n</function>\n</tool_call>';
+  for (const prose of [
+    'It matches `<function=name>` followed by anything.',
+    'It matches <function=name> followed by anything.', // not quoted at all
+    'regex `/<tool_call(?![A-Za-z0-9_])[^>]*>[\\s\\S]*<\\/tool_call>/` ok',
+    'a stray </tool_call> and an open <tool_call> in prose',
+  ]) {
+    const parsed = parseQwenXmlToolCalls(`${prose}\n\n${real}`);
+    assert.equal(parsed.toolCalls.length, 1, `calls for: ${prose}`);
+    assert.equal(parsed.toolCalls[0].name, 'powershell', `name for: ${prose}`);
+    assert.equal(JSON.parse(parsed.toolCalls[0].arguments).command, 'cd x');
+    assert.ok(parsed.text.startsWith(prose.slice(0, 10)), `prose kept for: ${prose}`);
+  }
+  // A quoted complete example is a mention, not a call.
+  assert.equal(parseQwenXmlToolCalls('use `<function=f><parameter=a>1</parameter></function>` like so').toolCalls.length, 0);
+  // Two sequential calls both survive.
+  assert.equal(parseQwenXmlToolCalls(`${real}\n${real}`).toolCalls.length, 2);
+  // Quoted markers are not "malformed markup"; a real block after them is.
+  assert.equal(hasRawToolCallMarkup('the `<tool_call>…</tool_call>` form'), false);
+  assert.equal(hasRawToolCallMarkup(`see \`<tool_call>\` then\n${real}`), true);
+  // Streaming: a backticked opener must not hold the rest of the stream back.
+  const s = splitVisibleFromToolCallBuffer('the `<tool_call>` tag then more prose');
+  assert.equal(s.holdback, '');
+}
+
 console.log('All character-handling tests passed.');

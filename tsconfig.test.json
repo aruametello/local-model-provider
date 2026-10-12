@@ -8,6 +8,7 @@
   "include": [
     "src/qwenXml.ts",
       "src/charUtils.ts",
+      "src/requestLog.ts",
       "test/**/*.ts"
     ]
 }

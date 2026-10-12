@@ -23,29 +23,75 @@ export interface ParsedQwenXmlToolCalls {
  */
 export function parseQwenXmlToolCalls(text: string): ParsedQwenXmlToolCalls {
   const toolCalls: QwenXmlToolCall[] = [];
-  const withoutToolCalls = text.replace(
-    // The <tool_call> wrapper tags are optional: models often drop the closing
-    // tag (stop-sequence cut, EOS right after </function>) or emit a bare
-    // <function=...> block. Requiring both tags made those calls unrecoverable.
-    /(?:<tool_call>\s*)?<function=([^>\s]+)>\s*([\s\S]*?)\s*<\/function>(?:\s*<\/tool_call>)?/g,
-    (_match, name, body) => {
-      const args: Record<string, unknown> = {};
-      const parameters = extractParameters(body);
 
-      for (const { key, value: rawValue } of parameters) {
-        args[key] = coerceParameterValue(rawValue);
-      }
+  // Pair every `</function>` with the NEAREST preceding unpaired `<function=`.
+  // A lazy "first open … first close" regex mis-pairs when the model's prose
+  // (typically its reasoning) MENTIONS `<function=name>` before the real call:
+  // the prose open swallowed the real call's `</function>`, producing a bogus
+  // call named "name" and eating both the prose and the real call. With
+  // nearest-open pairing a prose mention stays an unpaired open and is ignored.
+  const FUNC_OPEN = /<function=([^>\s]+)>/g;
+  const FUNC_CLOSE = '</function>';
+  const events: Array<{ idx: number; kind: 'open' | 'close'; name?: string; end: number }> = [];
+  for (let m = FUNC_OPEN.exec(text); m; m = FUNC_OPEN.exec(text)) {
+    events.push({ idx: m.index, kind: 'open', name: m[1], end: m.index + m[0].length });
+  }
+  for (let i = text.indexOf(FUNC_CLOSE); i !== -1; i = text.indexOf(FUNC_CLOSE, i + FUNC_CLOSE.length)) {
+    events.push({ idx: i, kind: 'close', end: i + FUNC_CLOSE.length });
+  }
+  events.sort((x, y) => x.idx - y.idx);
 
-      toolCalls.push({
-        id: `qwen_xml_${Date.now()}_${toolCalls.length}`,
-        name: String(name).trim(),
-        arguments: JSON.stringify(args),
-      });
-      return '';
+  const spans: Array<{ start: number; end: number }> = [];
+  const stack: Array<{ idx: number; name: string; end: number }> = [];
+  for (const ev of events) {
+    if (ev.kind === 'open') {
+      stack.push({ idx: ev.idx, name: ev.name as string, end: ev.end });
+      continue;
     }
-  );
+    const open = stack.pop();
+    if (!open) {
+      continue;
+    }
 
-  return { text: withoutToolCalls.trim(), toolCalls };
+    // Optional <tool_call> wrapper directly before the open / </tool_call> after the close.
+    let start = open.idx;
+    const before = text.slice(0, open.idx).replace(/\s+$/, '');
+    if (before.endsWith('<tool_call>')) {
+      start = before.length - '<tool_call>'.length;
+    }
+    let end = ev.end;
+    const after = /^\s*<\/tool_call>/.exec(text.slice(end));
+    if (after) {
+      end += after[0].length;
+    }
+
+    // A block quoted in inline code (`<function=x>…</function>`) is a mention, not a call.
+    if (text[start - 1] === '`' && text[end] === '`') {
+      continue;
+    }
+
+    const args: Record<string, unknown> = {};
+    for (const { key, value: rawValue } of extractParameters(text.slice(open.end, ev.idx).trim())) {
+      args[key] = coerceParameterValue(rawValue);
+    }
+    toolCalls.push({
+      id: `qwen_xml_${Date.now()}_${toolCalls.length}`,
+      name: open.name.trim(),
+      arguments: JSON.stringify(args),
+    });
+    spans.push({ start, end });
+  }
+
+  // Blocks are produced in close order == document order (nearest pairing never nests).
+  let out = '';
+  let cursor = 0;
+  for (const span of spans) {
+    out += text.slice(cursor, span.start);
+    cursor = span.end;
+  }
+  out += text.slice(cursor);
+
+  return { text: out.trim(), toolCalls };
 }
 
 /**
@@ -81,7 +127,12 @@ export function splitVisibleFromToolCallBuffer(buffer: string): { visible: strin
   for (;;) {
     let first: { open: string; close: string; idx: number } | undefined;
     for (const pair of PAIRS) {
-      const idx = buffer.indexOf(pair.open, cursor);
+      let idx = buffer.indexOf(pair.open, cursor);
+      // An opener right after a backtick is a prose mention (`<tool_call>`), not
+      // a call: do not hold the rest of the stream back for it.
+      while (idx > 0 && buffer[idx - 1] === '`') {
+        idx = buffer.indexOf(pair.open, idx + pair.open.length);
+      }
       if (idx !== -1 && (!first || idx < first.idx)) {
         first = { ...pair, idx };
       }
@@ -133,10 +184,12 @@ export function containsToolCallOpenMarker(text: string): boolean {
  *    typical when generation stops (stop sequence / length) before the close tag,
  *  - a bare `<function=name>…</function>` / `<parameter=` block with no wrapper.
  */
-export function hasRawToolCallMarkup(text: string): boolean {
-  if (!text) {
+export function hasRawToolCallMarkup(rawText: string): boolean {
+  if (!rawText) {
     return false;
   }
+  // Markers quoted in inline code are prose, not calls.
+  const text = rawText.replace(/`[^`\n]*`/g, '``');
   if (/<tool_call(?![A-Za-z0-9_])[^>]*>[\s\S]*<\/tool_call>/.test(text)) {
     return true;
   }

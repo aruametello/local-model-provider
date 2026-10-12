@@ -112,7 +112,7 @@ export interface OpenAIChatCompletionResponse {
 
 export interface GatewayConfig {
   serverUrl: string;
-  apiKey?: string;
+  apiKey: string;
   requestTimeout: number;
   enableToolCalling: boolean;
   parallelToolCalling: boolean;
@@ -122,6 +122,9 @@ export interface GatewayConfig {
   // call the model wrote as plain text) and retry with a corrective message.
   recoverMalformedToolCalls: boolean;
   includeUsageInStream: boolean;
+  // Folder for full per-request context logs ('' = disabled) and its size cap in megabytes.
+  requestLogDirectory: string;
+  requestLogMaxMb: number;
   maxRetries: number;
   retryDelayMs: number;
   modelCacheTtlMs: number;

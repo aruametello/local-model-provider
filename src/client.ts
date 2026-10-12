@@ -1,3 +1,4 @@
+import { writeRequestLog } from './requestLog';
 import * as vscode from 'vscode';
 import { randomBytes } from 'node:crypto';
 import {
@@ -141,6 +142,9 @@ export class GatewayClient {
   public updateConfig(config: GatewayConfig): void {
     this.config = config;
   }
+
+  /** Optional sink for diagnostics (wired to the output channel by the provider). */
+  public logSink?: (level: 'debug' | 'info' | 'warn' | 'error', message: string) => void;
 
   /**
    * Calculate exponential backoff delay with jitter
@@ -662,6 +666,28 @@ export class GatewayClient {
   }
 
   /**
+   * Save the exact request body to the request-log folder (when configured).
+   * Fire-and-forget: a logging failure must never affect the chat request.
+   * This is the single choke point for outgoing chat bodies, so main requests
+   * and every corrective/final-answer retry are all captured.
+   */
+  private logRequest(url: string, bodyJson: string): void {
+    const dir = this.config.requestLogDirectory;
+    if (!dir) {
+      return;
+    }
+    const maxBytes = Math.max(1, this.config.requestLogMaxMb) * 1024 * 1024;
+    writeRequestLog(dir, maxBytes, url, bodyJson).then(
+      (result) => {
+        this.logSink?.('debug', `Request log written: ${result.file}${result.deleted.length ? ` (pruned ${result.deleted.length} old file(s))` : ''}`);
+      },
+      (err) => {
+        this.logSink?.('warn', `Could not write request log to "${dir}": ${err instanceof Error ? err.message : String(err)}`);
+      }
+    );
+  }
+
+  /**
    * Stream chat completions from /v1/chat/completions endpoint
    *
    * IMPORTANT: Tool calls are tracked by INDEX during streaming, not by ID.
@@ -684,12 +710,15 @@ export class GatewayClient {
         body.stream_options = { include_usage: true };
       }
 
+      // Replacer sanitizes every string value in one pass over the JSON tree
+      // (see sanitizeLoneSurrogates) instead of a separate deep-clone.
+      const bodyJson = JSON.stringify(body, (_key, val) => typeof val === 'string' ? sanitizeLoneSurrogates(val) : val);
+      this.logRequest(url, bodyJson);
+
       const response = await this.fetchWithRetry(url, {
         method: 'POST',
         headers: { ...this.getHeaders(), 'Content-Type': 'application/json' },
-        // Replacer sanitizes every string value in one pass over the JSON tree
-        // (see sanitizeLoneSurrogates) instead of a separate deep-clone.
-        body: JSON.stringify(body, (_key, val) => typeof val === 'string' ? sanitizeLoneSurrogates(val) : val),
+        body: bodyJson,
       }, 'Chat completion', cancellationToken);
 
       if (!response.ok) {

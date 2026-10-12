@@ -185,7 +185,7 @@ export class StatusBarManager implements vscode.Disposable {
       },
       {
         label: '$(key) Set API Key',
-        description: 'Securely store your API key',
+        description: 'Open Settings to set the API key (next to the server URL)',
       },
       {
         label: '$(output) Show Output',
@@ -215,7 +215,7 @@ export class StatusBarManager implements vscode.Disposable {
         'local.model.provider'
       );
     } else if (selected.label.includes('Set API Key')) {
-      vscode.commands.executeCommand('local-model-provider-custom.setApiKey');
+      vscode.commands.executeCommand('workbench.action.openSettings', 'local.model.provider.apiKey');
     } else if (selected.label.includes('Show Output')) {
       vscode.commands.executeCommand('local-model-provider-custom.showOutput');
     }

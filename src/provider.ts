@@ -1,7 +1,6 @@
 import * as vscode from 'vscode';
 import { GatewayClient, GatewayError } from './client';
 import { GatewayConfig, OpenAIChatCompletionRequest, OpenAIUsage, OllamaModelCapabilities } from './types';
-import { SecretManager } from './secrets';
 import { StatisticsManager } from './statistics';
 import { parseQwenXmlToolCalls, splitVisibleFromToolCallBuffer, containsToolCallOpenMarker, hasRawToolCallMarkup } from './qwenXml';
 import { truncateToCodePoints } from './charUtils';
@@ -27,7 +26,6 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   private readonly client: GatewayClient;
   private config: GatewayConfig;
   private readonly outputChannel: vscode.OutputChannel;
-  private readonly secretManager: SecretManager;
   private readonly statsManager: StatisticsManager | null;
   // Store tool schemas for the current request to fill missing required properties
   private readonly currentToolSchemas: Map<string, unknown> = new Map();
@@ -38,33 +36,19 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   // Model cache
   private cachedModels: vscode.LanguageModelChatInformation[] | null = null;
   private modelCacheTimestamp: number = 0;
-  // Ensure async init (API key load) completes before first requests
-  private readonly initializationPromise: Promise<void>;
   // Event emitter for model list changes
   private readonly _onDidChangeLanguageModelChatInformation = new vscode.EventEmitter<void>();
   public readonly onDidChangeLanguageModelChatInformation = this._onDidChangeLanguageModelChatInformation.event;
 
   constructor(private readonly context: vscode.ExtensionContext, statsManager?: StatisticsManager) {
     this.outputChannel = vscode.window.createOutputChannel('Local Model Provider');
-    this.secretManager = new SecretManager(context, this.outputChannel);
     this.statsManager = statsManager ?? null;
     this.config = this.loadConfig();
     this.client = new GatewayClient(this.config, {
       maxRetries: this.config.maxRetries,
       baseDelayMs: this.config.retryDelayMs,
     });
-    
-    // Initialize API key from secure storage (store promise for awaiting later)
-    this.initializationPromise = this.initializeApiKey();
-
-    // React to secret storage changes (API key updates)
-    context.subscriptions.push(
-      context.secrets.onDidChange(async (e) => {
-        if (e.key === 'local.model.provider.apiKey') {
-          await this.refreshApiKey();
-        }
-      })
-    );
+    this.client.logSink = (level, message) => this.log(level, message);
 
     // Watch for configuration changes
     context.subscriptions.push(
@@ -78,39 +62,6 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         }
       })
     );
-  }
-
-  /**
-   * Initialize API key from secure storage asynchronously
-   */
-  private async initializeApiKey(): Promise<void> {
-    try {
-      const apiKey = await this.secretManager.getApiKey();
-      if (apiKey) {
-        this.config.apiKey = apiKey;
-        this.client.updateConfig(this.config);
-        this.log('info', 'API key loaded from secure storage');
-      }
-    } catch (error) {
-      this.log('error', `Failed to load API key: ${error}`);
-    }
-  }
-
-  /**
-   * Force refresh API key from secure storage and update client immediately
-   */
-  public async refreshApiKey(): Promise<void> {
-    try {
-      const apiKey = await this.secretManager.getApiKey();
-      this.config.apiKey = apiKey || '';
-      this.client.updateConfig(this.config);
-      this.log('info', apiKey ? 'API key updated from secure storage' : 'API key cleared');
-      // Clear model cache so next call revalidates with new credentials
-      this.cachedModels = null;
-      this.modelCacheTimestamp = 0;
-    } catch (error) {
-      this.log('error', `Failed to refresh API key: ${error}`);
-    }
   }
 
   /**
@@ -133,13 +84,6 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   public applyLatestConfiguration(): void {
     // Reuse existing reload logic
     this.reloadConfig();
-  }
-
-  /**
-   * Get the SecretManager for external use (e.g., commands)
-   */
-  public getSecretManager(): SecretManager {
-    return this.secretManager;
   }
 
   /**
@@ -644,12 +588,6 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     options: { silent: boolean; },
     token: vscode.CancellationToken
   ): Promise<vscode.LanguageModelChatInformation[]> {
-    // Ensure API key (and other async init) has completed
-    try {
-      await this.initializationPromise;
-    } catch {
-      // Ignore init errors here; downstream will surface issues
-    }
     this.log('debug', `API key configured: ${this.config.apiKey ? 'yes' : 'no'}`);
     // Check cache first
     const now = Date.now();
@@ -1520,12 +1458,6 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     progress: vscode.Progress<vscode.LanguageModelResponsePart>,
     token: vscode.CancellationToken
   ): Promise<void> {
-    // Ensure API key (and other async init) has completed before first request
-    try {
-      await this.initializationPromise;
-    } catch {
-      // Continue; errors will be handled by request path
-    }
     this.log('debug', `API key configured: ${this.config.apiKey ? 'yes' : 'no'}`);
     this.log('info', `Sending chat request to model: ${model.id}`);
     this.log('debug', `Tool mode: ${options.toolMode}, Tools: ${options.tools?.length || 0}`);
@@ -1920,7 +1852,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
     const cfg: GatewayConfig = {
       serverUrl: serverUrlRaw,
-      apiKey: '', // Loaded from SecretStorage via initializeApiKey()
+      apiKey: config.get<string>('apiKey', ''),
       requestTimeout: config.get<number>('requestTimeout', 60000),
       enableToolCalling: config.get<boolean>('enableToolCalling', true),
       parallelToolCalling: config.get<boolean>('parallelToolCalling', true),
@@ -1928,6 +1860,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       finalAnswerRetry: config.get<boolean>('finalAnswerRetry', true),
       recoverMalformedToolCalls: config.get<boolean>('recoverMalformedToolCalls', true),
       includeUsageInStream: config.get<boolean>('includeUsageInStream', true),
+      requestLogDirectory: (config.get<string>('requestLogDirectory', '') ?? '').trim(),
+      requestLogMaxMb: Math.max(1, config.get<number>('requestLogMaxMb', 100) || 100),
       maxRetries: config.get<number>('maxRetries', 3),
       retryDelayMs: config.get<number>('retryDelayMs', 1000),
       modelCacheTtlMs: config.get<number>('modelCacheTtlMs', 300000),

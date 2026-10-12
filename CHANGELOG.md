@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.20
+
+### New Features
+- **API key editable directly in Settings.** The API key is now a plain setting, `local.model.provider.apiKey`, shown in the Settings UI right next to the server URL. Set it inline (Settings editor or `settings.json`) and leave it empty for servers that do not require authentication. It is sent to the inference server in the `Authorization: Bearer` header (and the `x-api-key` fallback header) for every request. This replaces the previous SecretStorage-backed, per-server key management (the `setApiKey` / `manageApiKeys` commands and `src/secrets.ts` were removed in favor of the simple inline field).
+## 1.2.19
+
+### New Features
+- **Request log (`requestLogDirectory`, `requestLogMaxMb`).** Set `local.model.provider.requestLogDirectory` to a folder and the extension saves the full context sent upstream for every chat request (messages, tools, options; one `request-<timestamp>-<n>.json` per request, including the final-answer and malformed-tool-call retries) so past exchanges can be inspected when debugging. `requestLogMaxMb` (default 100) caps the folder: after each new file the oldest request logs are deleted until the total is under the limit (the newest file is always kept; other files in the folder are never touched). Empty directory = disabled (default). Logs contain your prompts, code and images: keep the folder private.
+
 ## 1.2.18
 
 ### Bug Fixes
@@ -7,6 +16,7 @@
 - **Unterminated tool calls are no longer silently dropped.** The streaming hold-back discarded an open `<tool_call>` block at end-of-stream; it is now parsed leniently (the `<tool_call>` wrapper/closing tag are optional) or shown and fed to recovery.
 - **Complete XML tool calls are converted as soon as they close**, instead of leaking as raw text mid-stream and relying on the end-of-stream pass. Content and reasoning hold-back tails are tracked separately.
 - **Corrective retry fixes:** a retry that produced only a structured tool call counts as success (it used to fall through to the "empty response" message); XML in the retry output is parsed; if the retry is malformed again it asks once more (max 2 attempts).
+- **Tool-call markers mentioned in prose no longer hijack the real call.** A reasoning trace quoting `<function=name>` / `<tool_call>` paired its mention with the real call's `</function>`, yielding a bogus call named `name` and swallowing the real one. The parser now pairs each `</function>` with the nearest preceding `<function=`, ignores blocks quoted in inline code, and the streaming hold-back / malformed detector ignore backtick-quoted markers.
 - Fixed a compile error (`xmlToolBuffer`) and broken tests left by the previous hold-back refactor.
 
 ## 1.2.17

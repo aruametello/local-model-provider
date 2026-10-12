@@ -2,7 +2,7 @@
   "name": "local-model-provider-custom",
   "displayName": "(custom) Local Model Provider",
   "description": "VS Code extension to connect to local LLM inference servers (Ollama, llama.cpp, LocalAI, LM Studio, vLLM) via OpenAI API compatible endpoints.",
-  "version": "1.2.18",
+  "version": "1.2.20",
   "publisher": "krevas",
   "icon": "assets/local-model-provider.png",
   "private": true,
@@ -19,9 +19,9 @@
     "esbuild-base": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --target=es2020",
     "esbuild": "npm run esbuild-base -- --sourcemap",
     "esbuild-watch": "npm run esbuild-base -- --sourcemap --watch",
-        "test": "tsc -p tsconfig.test.json && node out-test/test/qwenXml.test.js && node out-test/test/charHandling.test.js",
+        "test": "tsc -p tsconfig.test.json && node out-test/test/qwenXml.test.js && node out-test/test/charHandling.test.js && node out-test/test/requestLog.test.js",
     "test-qwen": "tsc -p tsconfig.test.json && node out-test/test/qwenXml.test.js",
-        "test-char": "tsc -p tsconfig.test.json && node out-test/test/charHandling.test.js",
+        "test-char": "tsc -p tsconfig.test.json && node out-test/test/charHandling.test.js && node out-test/test/requestLog.test.js",
         "test-compile": "tsc -p ./",
         "prebuild": "npm test",
         "prepackage": "npm test",
@@ -64,11 +64,6 @@
     ],
     "commands": [
       {
-        "command": "local-model-provider-custom.setApiKey",
-        "title": "Set API Key (Secure)",
-        "category": "(custom) Local Model Provider"
-      },
-      {
         "command": "local-model-provider-custom.showStatus",
         "title": "Show Server Status",
         "category": "(custom) Local Model Provider"
@@ -103,6 +98,12 @@
           "description": "Inference server URL (OpenAI API compatible endpoint)",
           "order": 1
         },
+        "local.model.provider.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key sent to the inference server in the Authorization: Bearer header. Leave empty if the server does not require authentication.",
+          "order": 2
+        },
         "local.model.provider.serverPresets": {
           "type": "array",
           "default": [],
@@ -121,7 +122,7 @@
             "required": ["name", "url"]
           },
           "description": "Saved server presets for quick switching",
-          "order": 2
+          "order": 3
         },
         "local.model.provider.requestTimeout": {
           "type": "number",
@@ -152,6 +153,19 @@
           "default": true,
           "description": "Try to recover from malformed tool calls: when the model writes a raw \"<tool_call> ... \" block as plain text instead of a structured tool call, send a corrective message asking it to retry and continue the task.",
           "order": 9
+        },
+        "local.model.provider.requestLogDirectory": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path of a folder where the FULL context sent to the upstream server for each chat request is saved (one JSON file per request: messages, tools, options). Meant for debugging past exchanges. Leave empty to disable. Files may contain your prompts, code and attached images, so keep this folder private.",
+          "order": 22
+        },
+        "local.model.provider.requestLogMaxMb": {
+          "type": "number",
+          "default": 100,
+          "minimum": 1,
+          "markdownDescription": "Maximum total size in megabytes of the request logs in `#local.model.provider.requestLogDirectory#`. After each new file is written, the oldest request logs are deleted until the folder is back under this limit (the newest file is always kept).",
+          "order": 23
         },
         "local.model.provider.finalAnswerRetry": {
           "type": "boolean",
