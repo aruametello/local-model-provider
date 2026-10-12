@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { parseQwenXmlToolCalls, extractParameters, coerceParameterValue } from '../src/qwenXml';
+import { parseQwenXmlToolCalls, extractParameters, coerceParameterValue, splitVisibleFromToolCallBuffer, hasRawToolCallMarkup, containsToolCallOpenMarker } from '../src/qwenXml';
 import { truncateToCodePoints } from '../src/charUtils';
 
 // ---------------------------------------------------------------------------
@@ -220,6 +220,137 @@ function hasUnpairedSurrogate(text: string): boolean {
     }
   }
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// qwenXml: tag-bounded hold-back for streamed <tool_call> blocks
+// ---------------------------------------------------------------------------
+
+// Plain text with no tool-call markup is fully visible, nothing held back.
+{
+  const { visible, holdback } = splitVisibleFromToolCallBuffer('Just some prose.\n');
+  assert.equal(visible, 'Just some prose.\n');
+  assert.equal(holdback, '');
+}
+
+// An empty buffer stays empty.
+{
+  const { visible, holdback } = splitVisibleFromToolCallBuffer('');
+  assert.equal(visible, '');
+  assert.equal(holdback, '');
+}
+
+// A complete <tool_call>…</tool_call> block is safe to show (it gets converted later).
+{
+  const block = '<tool_call> <function=create> <parameter=path>a.py</parameter> </function> </tool_call>';
+  const { visible, holdback } = splitVisibleFromToolCallBuffer(`prefix ${block}suffix`);
+  assert.equal(visible, `prefix ${block}suffix`);
+  assert.equal(holdback, '');
+}
+
+// An open block without its closing tag is held back from the open tag.
+{
+  const body = '<tool_call> <function=create> <parameter=code>print(1)';
+  const { visible, holdback } = splitVisibleFromToolCallBuffer(`intro ${body}`);
+  assert.equal(visible, 'intro ');
+  assert.equal(holdback, body);
+}
+
+// Two blocks: the first (closed) is safe, the second (open) is held back.
+{
+  const closed = '<tool_call> <function=f> </function> </tool_call>';
+  const open = '<tool_call> <function=g> <parameter=x>1';
+  const { visible, holdback } = splitVisibleFromToolCallBuffer(`${closed}${open}`);
+  assert.equal(visible, closed);
+  assert.equal(holdback, open);
+}
+
+// A stray closing tag with no matching open tag is ordinary text.
+{
+  const { visible, holdback } = splitVisibleFromToolCallBuffer('text then </tool_call> and more');
+  assert.equal(visible, 'text then </tool_call> and more');
+  assert.equal(holdback, '');
+}
+
+// A trailing fragment that is a strict prefix of "<tool_call" is held back
+// (tag split across a chunk boundary), the rest stays visible.
+{
+  const { visible, holdback } = splitVisibleFromToolCallBuffer('done now <tool_ca');
+  assert.equal(visible, 'done now ');
+  assert.equal(holdback, '<tool_ca');
+}
+
+// The full 10-char prefix "<tool_call" (minus the required '>' which may still
+// be streaming in) is held back.
+{
+  const { visible, holdback } = splitVisibleFromToolCallBuffer('x<tool_call');
+  assert.equal(visible, 'x');
+  assert.equal(holdback, '<tool_call');
+}
+
+// Simulated token-by-token stream: no <tool_call ever leaks into visible text
+// before the closing tag of that block has been seen.
+{
+  const fullText = 'Now I will edit:\n<tool_call> <function=create> <parameter=code>print("hi")</parameter> </function> </tool_call> all done';
+  let pending = '';
+  let emitted = '';
+  for (const char of fullText) {
+    const { visible, holdback } = splitVisibleFromToolCallBuffer(pending + char);
+    pending = holdback;
+    emitted += visible;
+    // Nothing may be emitted while a block is still open: the held-back tail
+    // must contain the only occurrence of "<tool_call" in the combined text.
+    const combined = visible + holdback;
+    if (combined.includes('<tool_call') && !combined.includes('</tool_call>')) {
+      assert.equal(visible.includes('<tool_call'), false, `leaked mid-block: ${JSON.stringify(visible)}`);
+    }
+  }
+  // After the whole text is in, the closed block plus trailing prose is safe.
+  const final = splitVisibleFromToolCallBuffer(pending);
+  assert.equal(final.holdback, '');
+  emitted += final.visible;
+  assert.ok(emitted.includes('all done'));
+}
+
+// Bare <function=...> block (no <tool_call> wrapper) is also bounded.
+{
+  const open = 'go <function=f> <parameter=a>1';
+  const r = splitVisibleFromToolCallBuffer(open);
+  assert.equal(r.visible, 'go ');
+  assert.equal(r.holdback, '<function=f> <parameter=a>1');
+  const closed = splitVisibleFromToolCallBuffer('go <function=f> <parameter=a>1</parameter> </function> done');
+  assert.equal(closed.holdback, '');
+}
+
+// Partial "<function" prefix at the end is held back too.
+{
+  const r = splitVisibleFromToolCallBuffer('ok <func');
+  assert.equal(r.visible, 'ok ');
+  assert.equal(r.holdback, '<func');
+}
+
+// Tolerant parsing: missing </tool_call>, and bare <function=...> blocks.
+{
+  const noClose = parseQwenXmlToolCalls('<tool_call>\n<function=read>\n<parameter=path>a.txt</parameter>\n</function>');
+  assert.equal(noClose.toolCalls.length, 1);
+  assert.equal(noClose.toolCalls[0].name, 'read');
+  assert.equal(noClose.text, '');
+  const bare = parseQwenXmlToolCalls('hi <function=read><parameter=path>b</parameter></function> bye');
+  assert.equal(bare.toolCalls.length, 1);
+  assert.equal(JSON.parse(bare.toolCalls[0].arguments).path, 'b');
+}
+
+// Malformed-markup detection.
+{
+  assert.equal(hasRawToolCallMarkup('plain answer'), false);
+  assert.equal(hasRawToolCallMarkup('the <tool_call> tag is used by Qwen'), false);
+  assert.equal(hasRawToolCallMarkup('<tool_call>{"name":"x","arguments":{}}</tool_call>'), true);
+  assert.equal(hasRawToolCallMarkup('<tool_call>\n<function=x>\n<parameter=a>1'), true); // unterminated
+  assert.equal(hasRawToolCallMarkup('<tool_call>\n{"name":"x"'), true); // unterminated JSON
+  assert.equal(hasRawToolCallMarkup('<function=x><parameter=a>1</parameter></function>'), true); // bare
+  assert.equal(hasRawToolCallMarkup('<tool_call >\n<function=x></function></tool_call>'), true);
+  assert.equal(containsToolCallOpenMarker('x <function=f>'), true);
+  assert.equal(containsToolCallOpenMarker('x < tool'), false);
 }
 
 console.log('All character-handling tests passed.');

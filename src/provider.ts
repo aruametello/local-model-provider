@@ -3,7 +3,7 @@ import { GatewayClient, GatewayError } from './client';
 import { GatewayConfig, OpenAIChatCompletionRequest, OpenAIUsage, OllamaModelCapabilities } from './types';
 import { SecretManager } from './secrets';
 import { StatisticsManager } from './statistics';
-import { parseQwenXmlToolCalls } from './qwenXml';
+import { parseQwenXmlToolCalls, splitVisibleFromToolCallBuffer, containsToolCallOpenMarker, hasRawToolCallMarkup } from './qwenXml';
 import { truncateToCodePoints } from './charUtils';
 import { buildCrashReport, writeCrashReport } from './crashLog';
 
@@ -1061,56 +1061,6 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     return parseQwenXmlToolCalls(text);
   }
 
-  private appendXmlToolBuffer(buffer: string, chunk: string): { buffer: string; buffering: boolean } {
-    const nextBuffer = buffer + chunk;
-    const lastOpenTag = nextBuffer.lastIndexOf('<tool_call');
-    const lastCloseTag = nextBuffer.lastIndexOf('</tool_call>');
-    return {
-      buffer: nextBuffer,
-      buffering: lastOpenTag > lastCloseTag,
-    };
-  }
-
-  /**
-   * Length of the longest suffix of `text` that is also a proper prefix of
-   * `tag` — i.e. how many trailing characters could be the start of a tag
-   * split across a stream chunk boundary, and must be held back instead of
-   * flushed as visible text.
-   */
-  private longestTagPrefixOverlap(text: string, tag: string): number {
-    const maxLen = Math.min(text.length, tag.length - 1);
-    for (let len = maxLen; len > 0; len--) {
-      if (text.endsWith(tag.slice(0, len))) {
-        return len;
-      }
-    }
-    return 0;
-  }
-
-  /**
-   * Streaming-safe detector for the start of a Qwen `<tool_call` tag. A tag
-   * can arrive split across two or more SSE chunks (e.g. `"<tool_c"` then
-   * `"all>..."`), so any not-yet-confirmed trailing text that could be a
-   * partial tag prefix must be held back in `pending` rather than flushed or
-   * dropped, until a following chunk proves or disproves it.
-   */
-  private consumeForXmlToolStart(
-    pending: string,
-    chunk: string
-  ): { visible: string; pending: string; tagStart?: string } {
-    const tag = '<tool_call';
-    const combined = pending + chunk;
-    const idx = combined.indexOf(tag);
-    if (idx !== -1) {
-      return { visible: combined.slice(0, idx), pending: '', tagStart: combined.slice(idx) };
-    }
-    const overlap = this.longestTagPrefixOverlap(combined, tag);
-    return {
-      visible: combined.slice(0, combined.length - overlap),
-      pending: combined.slice(combined.length - overlap),
-    };
-  }
-
   /**
    * Handle empty response from model
    */
@@ -1281,27 +1231,83 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   }
 
   /**
-   * Detect a malformed tool call: the model wrote a raw "<tool_call> ... </tool_call>"
-   * block as plain text instead of emitting a structured tool call. Only
-   * counts when NO structured tool call was produced — otherwise a model that
-   * legitimately discusses tool-call syntax in its answer would trigger a
-   * pointless retry.
+   * Detect a malformed tool call: the model wrote a raw tool-call block
+   * (`<tool_call>…</tool_call>`, an unterminated `<tool_call><function=…`, or a
+   * bare `<function=…>` block) as plain text instead of emitting a structured
+   * tool call. Only counts when NO structured tool call was produced —
+   * otherwise a model that legitimately discusses tool-call syntax in its
+   * answer would trigger a pointless retry. Reasoning is only inspected when
+   * there is no visible answer: thinking text that drafts or quotes a call,
+   * followed by a real answer, is not a failure.
    */
   private hasMalformedToolCall(totalContent: string, totalReasoningContent: string, totalToolCalls: number): boolean {
     if (totalToolCalls > 0) {
       return false;
     }
-    const openTag = '<tool_call>';
-    const closeTag = '</tool_call>';
-    const hasRawMarkup = (text: string) => text.includes(openTag) && text.includes(closeTag);
-    return hasRawMarkup(totalContent) || hasRawMarkup(totalReasoningContent);
+    if (hasRawToolCallMarkup(totalContent)) {
+      return true;
+    }
+    return totalContent.trim().length === 0 && hasRawToolCallMarkup(totalReasoningContent);
   }
 
   /**
-   * The model emitted a raw "<tool_call> ... </tool_call>" block as plain text (a malformed
-   * tool call). Send one corrective request telling it to retry with a proper
-   * tool call and continue the task. Returns true when the retry produced
-   * visible content.
+   * Report streamed visible text, converting any complete Qwen XML tool-call
+   * blocks inside it to structured tool calls. Text without tool-call markup is
+   * reported verbatim (untrimmed — chunk boundaries must not eat whitespace).
+   * Returns the number of structured tool calls emitted.
+   */
+  private flushVisibleWithXmlToolCalls(
+    text: string,
+    progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+    reasoningContent: string
+  ): number {
+    if (!text) {
+      return 0;
+    }
+    if (!containsToolCallOpenMarker(text)) {
+      progress.report(new vscode.LanguageModelTextPart(text));
+      return 0;
+    }
+    const parsed = this.extractXmlToolCalls(text);
+    for (const toolCall of parsed.toolCalls) {
+      this.outputChannel.appendLine('Converted Qwen XML tool call from streamed text.');
+      this.processToolCall(toolCall, progress, reasoningContent);
+    }
+    if (parsed.text) {
+      progress.report(new vscode.LanguageModelTextPart(parsed.text));
+    }
+    return parsed.toolCalls.length;
+  }
+
+  /**
+   * Convert XML tool calls found in streamed REASONING (never shown to the
+   * user in compat mode). Returns the number of structured tool calls emitted.
+   */
+  private convertReasoningXmlToolCalls(
+    text: string,
+    progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+    reasoningContent: string
+  ): number {
+    if (!containsToolCallOpenMarker(text)) {
+      return 0;
+    }
+    const parsed = this.extractXmlToolCalls(text);
+    for (const toolCall of parsed.toolCalls) {
+      this.outputChannel.appendLine('Converted Qwen XML tool call from streamed reasoning.');
+      this.processToolCall(toolCall, progress, reasoningContent);
+    }
+    return parsed.toolCalls.length;
+  }
+
+  /** Max corrective retries after a malformed (raw XML) tool call. */
+  private static readonly MAX_MALFORMED_TOOL_RETRIES = 2;
+
+  /**
+   * The model emitted a raw tool-call block as plain text (a malformed tool
+   * call). Send a corrective request telling it to retry with a proper tool
+   * call and continue the task. If the retry is itself malformed, try again
+   * (bounded). Returns true when the retry produced visible content or a
+   * structured tool call.
    */
   private async retryMalformedToolCall(
     baseRequestOptions: Record<string, unknown>,
@@ -1309,7 +1315,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     malformedText: string,
     progress: vscode.Progress<vscode.LanguageModelResponsePart>,
     token: vscode.CancellationToken,
-    modelId: string
+    modelId: string,
+    attempt = 1
   ): Promise<boolean> {
     const correctiveMessages = [
       ...messages,
@@ -1327,9 +1334,16 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     };
 
     let contentLength = 0;
+    let retryContent = '';
+    let retryReasoning = '';
+    let retryToolCalls = 0;
     let retryUsage: OpenAIUsage | undefined;
+    // Same tag-bounded hold-back as the main stream: if the corrective retry
+    // again emits a raw tool-call block, buffer it instead of leaking it.
+    let retryXmlPending = '';
+    const compat = this.config.qwenToolLoopCompat;
     const retryStartTime = Date.now();
-    this.log('warn', 'Detected malformed (raw XML) tool call in model output; running corrective retry.');
+    this.log('warn', `Detected malformed (raw XML) tool call in model output; running corrective retry (attempt ${attempt}/${GatewayProvider.MAX_MALFORMED_TOOL_RETRIES}).`);
 
     for await (const chunk of this.client.streamChatCompletion(retryOptions as unknown as OpenAIChatCompletionRequest, token)) {
       if (token.isCancellationRequested) {
@@ -1338,19 +1352,49 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       if (chunk.usage) {
         retryUsage = chunk.usage;
       }
+      if (chunk.reasoning_content) {
+        retryReasoning += chunk.reasoning_content;
+      }
       if (chunk.finished_tool_calls?.length) {
         for (const toolCall of chunk.finished_tool_calls) {
+          retryToolCalls++;
           this.processToolCall(toolCall, progress, '');
         }
       }
       if (chunk.content) {
-        contentLength += chunk.content.length;
-        progress.report(new vscode.LanguageModelTextPart(chunk.content));
+        retryContent += chunk.content;
+        if (compat) {
+          const split = splitVisibleFromToolCallBuffer(retryXmlPending + chunk.content);
+          const converted = this.flushVisibleWithXmlToolCalls(split.visible, progress, '');
+          retryToolCalls += converted;
+          if (converted === 0) {
+            contentLength += split.visible.length;
+          }
+          retryXmlPending = split.holdback;
+        } else {
+          contentLength += chunk.content.length;
+          progress.report(new vscode.LanguageModelTextPart(chunk.content));
+        }
       }
     }
 
     if (token.isCancellationRequested) {
       throw new GatewayError('Chat completion cancelled', undefined, false);
+    }
+
+    // Resolve any hold-back left over from the corrective retry: complete
+    // blocks (even without a closing </tool_call>) become structured tool
+    // calls; whatever text remains is shown.
+    if (compat && retryXmlPending) {
+      const converted = this.flushVisibleWithXmlToolCalls(retryXmlPending, progress, '');
+      retryToolCalls += converted;
+      if (converted === 0) {
+        contentLength += retryXmlPending.length;
+      }
+      retryXmlPending = '';
+    }
+    if (compat && retryReasoning) {
+      retryToolCalls += this.convertReasoningXmlToolCalls(retryReasoning, progress, '');
     }
 
     const sanitizedRetryUsage: OpenAIUsage | undefined = retryUsage
@@ -1372,13 +1416,21 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       this.statsManager.recordRequest({
         modelId,
         inputTokens: sanitizedRetryUsage?.prompt_tokens ?? 0,
-        outputTokens: sanitizedRetryUsage?.completion_tokens ?? Math.ceil(contentLength / 4),
+        outputTokens: sanitizedRetryUsage?.completion_tokens ?? Math.ceil((retryContent.length + retryReasoning.length) / 4),
         responseTimeMs: Date.now() - retryStartTime,
       });
     }
 
-    this.log('info', `Malformed-tool-call retry produced ${contentLength} content characters.`);
-    return contentLength > 0;
+    this.log('info', `Malformed-tool-call retry produced ${contentLength} content characters and ${retryToolCalls} tool calls.`);
+
+    // Still malformed: ask again, with the failed attempt in the transcript.
+    if (this.hasMalformedToolCall(retryContent, retryReasoning, retryToolCalls)
+      && attempt < GatewayProvider.MAX_MALFORMED_TOOL_RETRIES) {
+      const stillMalformed = hasRawToolCallMarkup(retryContent) ? retryContent : retryReasoning;
+      return this.retryMalformedToolCall(baseRequestOptions, correctiveMessages, stillMalformed, progress, token, modelId, attempt + 1);
+    }
+
+    return contentLength > 0 || retryToolCalls > 0;
   }
 
   /**
@@ -1598,12 +1650,13 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     try {
       let totalContent = '';
       let totalReasoningContent = '';
-      let xmlToolBuffer = '';
-      let bufferingXmlToolCall = false;
-      // Holds back trailing text that might be an as-yet-unconfirmed prefix
-      // of "<tool_call" split across a stream chunk boundary (see
-      // consumeForXmlToolStart). Tracked separately per source since
-      // reasoning_content and content deltas are distinct text streams.
+      // Holds back the not-yet-resolved tail of each text stream (content and
+      // reasoning_content tracked separately): an open
+      // "<tool_call>…" block whose closing tag hasn't arrived, or a trailing
+      // partial "<tool_call" prefix split across a chunk boundary. Everything
+      // up to the last CLOSED block is flushed to VS Code immediately (see
+      // splitVisibleFromToolCallBuffer), so raw XML never leaks mid-stream and
+      // complete blocks stop stalling the visible output.
       let xmlPendingReasoning = '';
       let xmlPendingContent = '';
       let totalToolCalls = 0;
@@ -1626,22 +1679,13 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         // Handle reasoning/thinking content from the model
         if (chunk.reasoning_content) {
           totalReasoningContent += chunk.reasoning_content;
-          if (this.config.qwenToolLoopCompat && bufferingXmlToolCall) {
-            const buffered = this.appendXmlToolBuffer(xmlToolBuffer, chunk.reasoning_content);
-            xmlToolBuffer = buffered.buffer;
-            bufferingXmlToolCall = buffered.buffering;
-          } else if (this.config.qwenToolLoopCompat) {
-            // Reasoning is never shown to the user in compat mode, so only the
-            // tag-start detection matters here — no visible text to flush.
-            const { pending, tagStart } = this.consumeForXmlToolStart(xmlPendingReasoning, chunk.reasoning_content);
-            if (tagStart !== undefined) {
-              const buffered = this.appendXmlToolBuffer(xmlToolBuffer, tagStart);
-              xmlToolBuffer = buffered.buffer;
-              bufferingXmlToolCall = buffered.buffering;
-              xmlPendingReasoning = '';
-            } else {
-              xmlPendingReasoning = pending;
-            }
+          if (this.config.qwenToolLoopCompat) {
+            // Reasoning is never shown to the user in compat mode: convert
+            // each complete tool-call block as soon as it closes, hold back
+            // the unresolved tail.
+            const split = splitVisibleFromToolCallBuffer(xmlPendingReasoning + chunk.reasoning_content);
+            totalToolCalls += this.convertReasoningXmlToolCalls(split.visible, progress, totalReasoningContent);
+            xmlPendingReasoning = split.holdback;
           } else if (typeof (vscode as any).LanguageModelThinkingPart !== 'undefined') {
             progress.report(new (vscode as any).LanguageModelThinkingPart(chunk.reasoning_content));
           } else {
@@ -1652,23 +1696,14 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
         if (chunk.content) {
           totalContent += chunk.content;
-          if (this.config.qwenToolLoopCompat && bufferingXmlToolCall) {
-            const buffered = this.appendXmlToolBuffer(xmlToolBuffer, chunk.content);
-            xmlToolBuffer = buffered.buffer;
-            bufferingXmlToolCall = buffered.buffering;
-          } else if (this.config.qwenToolLoopCompat) {
-            const { visible, pending, tagStart } = this.consumeForXmlToolStart(xmlPendingContent, chunk.content);
-            if (visible) {
-              progress.report(new vscode.LanguageModelTextPart(visible));
-            }
-            if (tagStart !== undefined) {
-              const buffered = this.appendXmlToolBuffer(xmlToolBuffer, tagStart);
-              xmlToolBuffer = buffered.buffer;
-              bufferingXmlToolCall = buffered.buffering;
-              xmlPendingContent = '';
-            } else {
-              xmlPendingContent = pending;
-            }
+          if (this.config.qwenToolLoopCompat) {
+            // Flush everything up to the last CLOSED <tool_call> block as visible text; hold back an open,
+            // unclosed block (or a trailing partial "<tool_call" prefix) until its
+            // closing tag arrives or the stream ends — this is what prevents raw
+            // XML from leaking mid-stream without stalling normal output.
+            const split = splitVisibleFromToolCallBuffer(xmlPendingContent + chunk.content);
+            totalToolCalls += this.flushVisibleWithXmlToolCalls(split.visible, progress, totalReasoningContent);
+            xmlPendingContent = split.holdback;
           } else {
             progress.report(new vscode.LanguageModelTextPart(chunk.content));
           }
@@ -1691,23 +1726,20 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         throw new GatewayError('Chat completion cancelled', undefined, false);
       }
 
-      // Any content still held back as a possible "<tool_call" tag prefix
-      // never got confirmed by end of stream — it wasn't a tag after all, so
-      // flush it now as ordinary visible text.
-      if (this.config.qwenToolLoopCompat && xmlPendingContent) {
-        progress.report(new vscode.LanguageModelTextPart(xmlPendingContent));
-        xmlPendingContent = '';
-      }
-
+      // End of stream: resolve whatever is still held back in each text
+      // stream. A block whose closing </tool_call> never arrived (stop
+      // sequence, EOS right after </function>) is still parsed leniently into a
+      // structured call; text that cannot be parsed (JSON-style or truncated
+      // blocks) is shown to the user and stays in totalContent/totalReasoningContent,
+      // where hasMalformedToolCall() sees it and triggers the corrective retry.
       if (this.config.qwenToolLoopCompat) {
-        const parsedXml = this.extractXmlToolCalls(xmlToolBuffer);
-        for (const toolCall of parsedXml.toolCalls) {
-          totalToolCalls++;
-          this.outputChannel.appendLine('Converted Qwen XML tool call from streamed text/reasoning.');
-          this.processToolCall(toolCall, progress, totalReasoningContent);
+        if (xmlPendingContent) {
+          totalToolCalls += this.flushVisibleWithXmlToolCalls(xmlPendingContent, progress, totalReasoningContent);
+          xmlPendingContent = '';
         }
-        if (parsedXml.text) {
-          progress.report(new vscode.LanguageModelTextPart(parsedXml.text));
+        if (xmlPendingReasoning) {
+          totalToolCalls += this.convertReasoningXmlToolCalls(xmlPendingReasoning, progress, totalReasoningContent);
+          xmlPendingReasoning = '';
         }
       }
 
@@ -1763,7 +1795,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       // block as plain text instead of a structured tool call. Send one
       // corrective request telling it to retry and continue the task.
       if (this.config.recoverMalformedToolCalls && this.hasMalformedToolCall(totalContent, totalReasoningContent, totalToolCalls)) {
-        const malformedText = totalContent.includes('<tool_call>') ? totalContent : totalReasoningContent;
+        const malformedText = hasRawToolCallMarkup(totalContent) ? totalContent : totalReasoningContent;
         const retried = await this.retryMalformedToolCall(requestOptions, truncatedMessages, malformedText, progress, token, model.id);
         if (retried) {
           return;
@@ -1798,7 +1830,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
             : '';
           const message = hasToolResults
             ? 'The tool call completed, but the model produced reasoning without a final summary. Check the tool result above for the completed action.'
-            : xmlToolBuffer.includes('<tool_call')
+            : hasRawToolCallMarkup(totalReasoningContent)
               ? 'The model started a tool call in its reasoning stream but did not complete a structured tool call before generation stopped. Try again with a narrower request, or reduce the reasoning budget if this keeps happening.'
               : `The model produced reasoning but no final answer or tool call. Try again with a narrower request, or reduce the reasoning budget if this keeps happening.${finishHint}`;
           this.log('warn', `Model returned reasoning-only response (${totalReasoningContent.length} reasoning characters, finish_reason=${lastFinishReason ?? 'unknown'}).`);

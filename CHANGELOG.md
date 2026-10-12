@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.18
+
+### Bug Fixes
+- **Malformed `<tool_call>` recovery now fires on the failures it used to miss.** Detection (`hasRawToolCallMarkup`) previously required the literal `<tool_call>` AND `</tool_call>`; it now also catches unterminated blocks (generation cut off by a stop sequence or length), JSON-style blocks, bare `<function=…>` blocks and `<tool_call ...>` variants, while ignoring prose that merely mentions the tag. Reasoning text is only inspected when there is no visible answer, so thinking that quotes a call no longer causes a pointless retry.
+- **Unterminated tool calls are no longer silently dropped.** The streaming hold-back discarded an open `<tool_call>` block at end-of-stream; it is now parsed leniently (the `<tool_call>` wrapper/closing tag are optional) or shown and fed to recovery.
+- **Complete XML tool calls are converted as soon as they close**, instead of leaking as raw text mid-stream and relying on the end-of-stream pass. Content and reasoning hold-back tails are tracked separately.
+- **Corrective retry fixes:** a retry that produced only a structured tool call counts as success (it used to fall through to the "empty response" message); XML in the retry output is parsed; if the retry is malformed again it asks once more (max 2 attempts).
+- Fixed a compile error (`xmlToolBuffer`) and broken tests left by the previous hold-back refactor.
+
 ## 1.2.17
 
 ### Bug Fixes

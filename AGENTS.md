@@ -72,7 +72,7 @@ streams the completion back through `client.streamChatCompletion()`, and reports
 | `src/secrets.ts` | `SecretManager`: API key in `vscode.SecretStorage` (key: `local.model.provider.apiKey`), legacy settings migration | Never log the key. |
 | `src/statusBar.ts` | Status bar item (`$(plug)/$(check)/$(error)` "Local LLM"), quick-pick status menu, server presets UI types (`ServerPreset`, `ServerStatus`) | |
 | `src/statistics.ts` | In-memory per-session request stats + `onStatsUpdate` event feeding the status bar | `formatTokens`/`formatDuration` are static helpers used by `extension.ts`. |
-| `src/qwenXml.ts` | Pure function `parseQwenXmlToolCalls()` — parses Qwen's raw XML tool-call format (`<tool_call> <function=...> <parameter=...>`) into structured calls; unit-tested | **Tag-aware scanner, not lazy regexes.** A lazy `[\s\S]*?<\/parameter>` match stops at the FIRST closing tag, so a parameter value containing the literal text `</parameter>` (code snippets, strings) was silently truncated. `extractParameters()` matches each `<parameter=` open tag to the LAST `</parameter>` before the next `<parameter=`/`</function>` boundary; `coerceParameterValue()` applies the int/float/bool/JSON coercion. Keep it dependency-free (no vscode import) so `tsconfig.test.json` can compile it standalone. The caller (`provider.ts`) is responsible for reassembling a `<tool_call` opening tag that streamed split across two SSE chunks BEFORE handing text to this parser — see `consumeForXmlToolStart`/`appendXmlToolBuffer`. |
+| `src/qwenXml.ts` | Pure function `parseQwenXmlToolCalls()` — parses Qwen's raw XML tool-call format (`<tool_call> <function=...> <parameter=...>`) into structured calls; unit-tested | **Tag-aware scanner, not lazy regexes.** A lazy `[\s\S]*?<\/parameter>` match stops at the FIRST closing tag, so a parameter value containing the literal text `</parameter>` (code snippets, strings) was silently truncated. `extractParameters()` matches each `<parameter=` open tag to the LAST `</parameter>` before the next `<parameter=`/`</function>` boundary; `coerceParameterValue()` applies the int/float/bool/JSON coercion. Keep it dependency-free (no vscode import) so `tsconfig.test.json` can compile it standalone. Also exports `splitVisibleFromToolCallBuffer()` (streaming hold-back: everything up to the last CLOSED `<tool_call>…</tool_call>` / bare `<function=…>…</function>` block is visible, the unresolved tail is held back), `containsToolCallOpenMarker()` and `hasRawToolCallMarkup()` (malformed-call detector). **Parsing is tolerant**: the `<tool_call>` wrapper and its closing tag are optional, so a block cut off after `</function>` (stop sequence/EOS) or a bare `<function=…>` still becomes a structured call. The caller (`provider.ts`) feeds streamed text through `splitVisibleFromToolCallBuffer` and then `flushVisibleWithXmlToolCalls`/`convertReasoningXmlToolCalls`. |
 | `src/charUtils.ts` | `truncateToCodePoints()` — truncates a string by Unicode code points so a UTF-16 `.slice(0, n)` can never split a surrogate pair (used by `retryFinalAnswer`'s reasoning budget) | Dependency-free (no vscode import) so `tsconfig.test.json` can compile it standalone. If you add more pure string helpers, put them here so they stay unit-testable. |
 | `src/crashLog.ts` | `buildCrashReport()` + `writeCrashReport()` — writes a "how did I get here" snapshot to `context.globalStorageUri` whenever a chat request fails, and returns the file path so `handleChatError` can surface it to the user | Redacts API keys / bearer tokens / base64 image payloads before writing. Never let logging itself break the user-facing error path (wrapped in try/catch). |
 | `test/qwenXml.test.ts` | Plain Node test runner for `qwenXml` (no framework) | Run via `npm test`. |
@@ -342,14 +342,28 @@ Notes:
   per chunk; a token-by-token server can emit `"<tool_c"` then `"all>..."`,
   which either leaked raw XML into the visible response (content path) or
   silently dropped the whole tool call (reasoning_content path — none of its
-  branches matched a bare fragment). Fixed with `consumeForXmlToolStart()` +
-  `longestTagPrefixOverlap()`: any trailing text that could still be an
-  unconfirmed prefix of `<tool_call` is held back (`xmlPendingContent`/
-  `xmlPendingReasoning`) across chunk boundaries instead of being flushed or
-  dropped, and only resolved once a following chunk proves or disproves it.
-  Any leftover pending text is flushed as visible content at end-of-stream. If
-  you touch this path, keep the pending/hold-back pattern — do not go back to
-  a single-chunk substring check.
+  branches matched a bare fragment). Fixed (1.2.18) with the pure
+  `splitVisibleFromToolCallBuffer()` in `qwenXml.ts`: the buffer is cut at the
+  tag PAIR boundary, so a partial opening marker or an open, not-yet-closed
+  block stays in `xmlPendingContent`/`xmlPendingReasoning` across chunks.
+  Closed blocks are converted to structured tool calls immediately
+  (`flushVisibleWithXmlToolCalls` for content, `convertReasoningXmlToolCalls`
+  for reasoning), not just at end-of-stream. At end-of-stream the held-back
+  tail is resolved with the tolerant parser (missing `</tool_call>` is fine);
+  text that still can't be parsed is shown AND stays in `totalContent`, so
+  malformed-call recovery sees it. NEVER discard the held-back tail at
+  end-of-stream (the 1.2.17 working copy did, silently losing unterminated
+  calls) and never concatenate the content and reasoning tails.
+- **Malformed tool-call recovery detects more than a closed pair (1.2.18).**
+  `hasRawToolCallMarkup()` matches a full `<tool_call>…</tool_call>` pair (XML or
+  JSON body), an UNTERMINATED `<tool_call>` followed by `<function=` or `{`
+  (generation cut off), and a bare `<function=…>` block; prose that merely
+  names `<tool_call>` does not match. Reasoning is inspected only when the
+  visible answer is empty (a thinking trace that quotes a call, followed by a
+  real answer, must not trigger a retry). `retryMalformedToolCall` parses XML
+  in its own output, counts structured tool calls (a retry that only emitted a
+  tool call is a success, not an "empty response"), and re-asks up to
+  `MAX_MALFORMED_TOOL_RETRIES` (2) times when the retry is malformed too.
 
 ## 8. Change checklist (do ALL that apply per change)
 

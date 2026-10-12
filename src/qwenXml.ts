@@ -24,7 +24,10 @@ export interface ParsedQwenXmlToolCalls {
 export function parseQwenXmlToolCalls(text: string): ParsedQwenXmlToolCalls {
   const toolCalls: QwenXmlToolCall[] = [];
   const withoutToolCalls = text.replace(
-    /<tool_call>\s*<function=([^>\s]+)>\s*([\s\S]*?)\s*<\/function>\s*<\/tool_call>/g,
+    // The <tool_call> wrapper tags are optional: models often drop the closing
+    // tag (stop-sequence cut, EOS right after </function>) or emit a bare
+    // <function=...> block. Requiring both tags made those calls unrecoverable.
+    /(?:<tool_call>\s*)?<function=([^>\s]+)>\s*([\s\S]*?)\s*<\/function>(?:\s*<\/tool_call>)?/g,
     (_match, name, body) => {
       const args: Record<string, unknown> = {};
       const parameters = extractParameters(body);
@@ -43,6 +46,104 @@ export function parseQwenXmlToolCalls(text: string): ParsedQwenXmlToolCalls {
   );
 
   return { text: withoutToolCalls.trim(), toolCalls };
+}
+
+/**
+ * Split an accumulated streamed text buffer into the portion that is safe to
+ * display now and the portion that must be held back until more of the stream
+ * arrives (or end-of-stream resolution).
+ *
+ * Qwen models can emit an entire tool call as plain text
+ * (`<tool_call>…</tool_call>`) instead of structured tool_calls. A hold-back bounded by a fixed
+ * number of trailing tokens is wrong in both directions: the block body can be
+ * arbitrarily long (whole code snippets), and flushing "everything before the
+ * last n characters" would leak raw XML mid-stream. The correct boundary is
+ * the tag pair itself: everything up to and including the LAST CLOSED
+ * `<tool_call>…</tool_call>` block is safe to show (the caller converts it via
+ * `parseQwenXmlToolCalls`), while anything from an open `<tool_call` whose
+ * `</tool_call>` has not arrived yet stays held back until the closing tag completes it
+ * or end-of-stream resolves the remainder.
+ *
+ * A trailing fragment that is a strict prefix of `<tool_call` (the tag split
+ * across two SSE chunks, e.g. `"<tool_c"` then `"all>..."`) is also held back,
+ * so an incomplete open tag can never be half-flushed and misread as text.
+ */
+export function splitVisibleFromToolCallBuffer(buffer: string): { visible: string; holdback: string } {
+  // Each opening marker with the marker that terminates its block. A bare
+  // `<function=` block (no `<tool_call>` wrapper) closes at `</function>`.
+  const PAIRS = [
+    { open: '<tool_call', close: '</tool_call>' },
+    { open: '<function=', close: '</function>' },
+  ];
+
+  let safeEnd = 0;
+  let cursor = 0;
+  for (;;) {
+    let first: { open: string; close: string; idx: number } | undefined;
+    for (const pair of PAIRS) {
+      const idx = buffer.indexOf(pair.open, cursor);
+      if (idx !== -1 && (!first || idx < first.idx)) {
+        first = { ...pair, idx };
+      }
+    }
+    if (!first) {
+      break;
+    }
+    const closeIdx = buffer.indexOf(first.close, first.idx + first.open.length);
+    if (closeIdx === -1) {
+      // Open marker without its closing marker yet: hold back from the open marker.
+      return { visible: buffer.slice(0, first.idx), holdback: buffer.slice(first.idx) };
+    }
+    safeEnd = closeIdx + first.close.length;
+    cursor = safeEnd;
+  }
+
+  if (safeEnd === buffer.length) {
+    return { visible: buffer, holdback: '' };
+  }
+
+  // Text after the last closed block may end with a partial opening marker
+  // split across a chunk boundary: hold back only that suffix.
+  let holdLen = 0;
+  for (const pair of PAIRS) {
+    const maxHold = Math.min(buffer.length - safeEnd, pair.open.length - 1);
+    for (let len = maxHold; len > holdLen; len--) {
+      if (buffer.endsWith(pair.open.slice(0, len))) {
+        holdLen = len;
+        break;
+      }
+    }
+  }
+
+  return { visible: buffer.slice(0, buffer.length - holdLen), holdback: buffer.slice(buffer.length - holdLen) };
+}
+
+/** True when the text contains a `<tool_call` / `<function=` opening marker. */
+export function containsToolCallOpenMarker(text: string): boolean {
+  return /<tool_call(?![A-Za-z0-9_])|<function=[^>\s]+>/.test(text);
+}
+
+/**
+ * Detect a malformed tool call written as plain text: a raw tool-call block
+ * that is NOT backed by a structured tool call. Deliberately stricter than
+ * "contains the tag name" so prose that merely mentions `<tool_call>` does not
+ * trigger a corrective retry, but covers every shape seen in practice:
+ *  - a full `<tool_call>…</tool_call>` pair (any body: XML or JSON),
+ *  - an UNTERMINATED block (`<tool_call>` followed by `<function=` or `{`),
+ *    typical when generation stops (stop sequence / length) before the close tag,
+ *  - a bare `<function=name>…</function>` / `<parameter=` block with no wrapper.
+ */
+export function hasRawToolCallMarkup(text: string): boolean {
+  if (!text) {
+    return false;
+  }
+  if (/<tool_call(?![A-Za-z0-9_])[^>]*>[\s\S]*<\/tool_call>/.test(text)) {
+    return true;
+  }
+  if (/<tool_call(?![A-Za-z0-9_])[^>]*>\s*(?:<function=|\{)/.test(text)) {
+    return true;
+  }
+  return /<function=[^>\s]+>[\s\S]*(?:<parameter=|<\/function>)/.test(text);
 }
 
 /**
