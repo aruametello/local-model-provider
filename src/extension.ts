@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as fs from 'node:fs/promises';
 import { GatewayProvider } from './provider';
 import { StatusBarManager, ServerStatus, ServerPreset } from './statusBar';
 import { StatisticsManager } from './statistics';
@@ -376,14 +377,29 @@ export function activate(context: vscode.ExtensionContext) {
               { silent: false },
               new vscode.CancellationTokenSource().token
             );
-            statusBar.setStatus(ServerStatus.Connected, { modelCount: models.length });
+            // 'lastKnown' = the fetch failed or the server reported no models
+            // yet, so the provider kept the last known list instead
+            const source = provider.getLastModelListSource();
+            if (source === 'live') {
+              statusBar.setStatus(ServerStatus.Connected, { modelCount: models.length });
+            }
             if (models.length > 0) {
-              vscode.window.showInformationMessage(
-                `Model cache refreshed. Found ${models.length} model(s): ${models.map(m => m.name).join(', ')}`
+              if (source === 'live') {
+                vscode.window.showInformationMessage(
+                  `Model cache refreshed. Found ${models.length} model(s): ${models.map(m => m.name).join(', ')}`
+                );
+              } else {
+                vscode.window.showWarningMessage(
+                  `Model list not refreshed — kept the last known list (${models.length} model(s)).`
+                );
+              }
+            } else if (source === 'live') {
+              vscode.window.showWarningMessage(
+                'Model cache refreshed. No models found.'
               );
             } else {
               vscode.window.showWarningMessage(
-                'Model cache refreshed. No models found.'
+                'No models found on the server.'
               );
             }
           } catch (error) {
@@ -404,6 +420,32 @@ export function activate(context: vscode.ExtensionContext) {
     }
   );
 
+  // Open the request log folder in the OS file explorer. Also linked from the
+  // requestLogDirectory setting description (command: link in markdownDescription).
+  const openRequestLogFolderCommand = vscode.commands.registerCommand(
+    'local-model-provider-custom.openRequestLogFolder',
+    async () => {
+      const dir = (vscode.workspace.getConfiguration('local.model.provider').get<string>('requestLogDirectory', '') ?? '').trim();
+      if (!dir) {
+        const choice = await vscode.window.showInformationMessage(
+          'Request log is disabled. Set a folder in "Request Log Directory" to enable it.',
+          'Open Setting'
+        );
+        if (choice === 'Open Setting') {
+          await vscode.commands.executeCommand('workbench.action.openSettings', 'local.model.provider.requestLogDirectory');
+        }
+        return;
+      }
+      try {
+        await fs.mkdir(dir, { recursive: true });
+        await vscode.env.openExternal(vscode.Uri.file(dir));
+      } catch (error) {
+        vscode.window.showErrorMessage(`Could not open request log folder "${dir}": ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  context.subscriptions.push(openRequestLogFolderCommand);
   context.subscriptions.push(showStatusCommand);
   context.subscriptions.push(selectModelCommand);
   context.subscriptions.push(switchServerCommand);

@@ -40,7 +40,7 @@ const DEFAULT_RETRY_CONFIG: RetryConfig = {
  * surfacing as a confusing "invalid request" error. Sanitize right before the
  * wire format is produced so no code path can leak one through.
  */
-function sanitizeLoneSurrogates(value: string): string {
+export function sanitizeLoneSurrogates(value: string): string {
   return value.replace(
     /([\uD800-\uDBFF])(?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])([\uDC00-\uDFFF])/g,
     '\uFFFD'
@@ -166,8 +166,12 @@ export class GatewayClient {
     // with the real error (ECONNREFUSED, timeout, ECONNRESET) nested in the
     // `cause` property. Walk the cause chain and also check `error.code` so a
     // stopped local server is retried instead of failing instantly.
+    // The visited set guards against cyclic cause chains (err.cause === err,
+    // or a longer loop), which would otherwise spin here forever.
+    const visited = new Set<unknown>();
     let current: unknown = error;
-    while (current instanceof Error) {
+    while (current instanceof Error && !visited.has(current)) {
+      visited.add(current);
       const message = current.message.toLowerCase();
       // `error.code` is not guaranteed to be a string — Node/undici and some
       // servers attach numeric codes. Guard the type before calling
@@ -257,8 +261,9 @@ export class GatewayClient {
           throw new GatewayError(`${operation} cancelled`, undefined, false);
         }
         lastError = error instanceof Error ? error : new Error(String(error));
+        const retryable = this.isRetryableError(error);
         
-        if (this.isRetryableError(error) && attempt < this.retryConfig.maxRetries) {
+        if (retryable && attempt < this.retryConfig.maxRetries) {
           const delay = this.calculateBackoffDelay(attempt);
           console.log(`[LLM Gateway] ${operation} failed with error: ${lastError.message}, retrying in ${delay}ms (attempt ${attempt + 1}/${this.retryConfig.maxRetries})`);
           const waited = await this.sleepCancellable(delay, cancellationToken);
@@ -268,10 +273,13 @@ export class GatewayClient {
           continue;
         }
         
+        // Carry the real classification through: a retryable error whose
+        // retries are exhausted stays retryable so callers (and crash logs)
+        // can tell "server was down" from "request was invalid".
         throw new GatewayError(
           `${operation} failed after ${attempt + 1} attempts: ${lastError.message}`,
           undefined,
-          false,
+          retryable,
           lastError
         );
       }
@@ -871,8 +879,10 @@ export class GatewayClient {
   private getHeaders(): Record<string, string> {
     const headers: Record<string, string> = {};
 
-    if (this.config.apiKey) {
-      const raw = String(this.config.apiKey).trim();
+    // Trim first: a whitespace-only key would otherwise emit
+    // `Authorization: 'Bearer '` / `x-api-key: ''` and confuse gateways.
+    const raw = String(this.config.apiKey ?? '').trim();
+    if (raw) {
       const bearer = raw.toLowerCase().startsWith('bearer ') ? raw : `Bearer ${raw}`;
       // Standard OpenAI-compatible header
       headers['Authorization'] = bearer;

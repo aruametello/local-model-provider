@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.2.23
+
+### Bug Fixes
+- **Retry logic can no longer hang forever.** `isRetryableError` walked an error's `cause` chain without a cycle guard; an error object with a circular `cause` (e.g. `a.cause = b; b.cause = a`) spun the retry check forever. The walk now keeps a visited set, still detects retryable errors anywhere in the chain, and terminates on cycles.
+- **Whitespace-only API key is now treated as no key.** A key of spaces used to be sent to the wire as an empty `Authorization: Bearer ` / `x-api-key: ''` credential; the key is trimmed first and an empty value sends no auth headers at all.
+- **Exhausted retries keep their true classification.** When a network failure ran out of retries, the final error reported `isRetryable: false`, indistinguishable from a rejected request; crash reports and error handling can now tell "server was down" from "request was invalid".
+- **`serverUrl` must be an absolute `http(s)` URL.** The classic typo `localhost:8000` (no scheme) used to pass validation — `new URL()` reads `localhost:` as a *scheme* — and then failed on every request with a confusing error. It now fails fast at activation with a clear message naming the required `http://`/`https://` prefix.
+- **SmolVLM models are detected as vision-capable.** The heuristic list claimed (in a comment) to match them but did not; there is now an explicit `smolvlm` pattern. The loose `-v<digit>` fallback, which mis-flagged ordinary version suffixes (`my-model-v2`), was tightened to `-v<digits>b`.
+
+### Tests
+- **New end-to-end output-fidelity suite** (`test/outputFidelity.test.ts`, 11 cases): proves model output is never mangled between the SSE wire and the VS Code response parts — backslash-dense Windows scripts (paths, PowerShell, `"` and `\n` sequences that must stay literal) round-trip character-for-character, including wire slices that split escape sequences and 4-byte emoji mid-character; hand-built JSON escapes decode to exactly the right characters; tool-call arguments keep escaped backslashes and nested quotes after parsing; lone surrogates arriving from a server pass through untouched (sanitization is outgoing-only); and Qwen-XML compat mode neither rewrites backslash-heavy prose nor corrupts parameters inside real tool calls.
+- Every bug fixed above now has a regression test (they were previously pinned as **KNOWN QUIRK** cases; the pins were re-pointed to the fixed behaviour).
+
+## 1.2.22
+
+### Bug Fixes
+- **Model list no longer gets stuck empty when the server is not ready.** When the model list cannot be loaded — the IDE came up before the server, the server is restarting, or the server responds but does not report models yet — the extension now keeps the **last known model list** instead of an empty one, so models stay selectable without a manual "Refresh Models" call. The last known list is persisted and survives IDE restarts, and it is only reused for the server URL it was fetched from (switching to a different server never shows another server's stale models). A failed "Refresh Models" no longer leaves the picker empty either, and now reports "kept the last known list" instead of pretending the refresh succeeded.
+- **Automatic model-list recovery.** While the server is not reporting a model list, the extension re-fetches in the background every 30 s and updates the picker automatically once models are available — no manual refresh needed.
+
+### Tests
+
+- Unit tests now cover `client.ts`, `provider.ts`, `statistics.ts` and `crashLog.ts`, which previously had no automated coverage: 247 new cases across seven suites — the SSE wire layer (chunk reassembly across TCP boundaries, CRLF, trailing `usage` chunks, tool-call accumulation by index, connection drops *before* vs. *after* receiving data, invalid UTF-8), context/token budgeting (the `maxInputTokens + maxOutputTokens` invariant, `max_tokens` omission when the input fills the window, fixed image token budgets), VS Code part → OpenAI message conversion, string-aware JSON repair, config loading and model listing (server order, TTL cache, all four vision-detection layers, last-known fallback isolation), request statistics, and crash-report redaction plus its never-throw contract.
+- A `vscode` runtime stub (`test/vscodeRuntime.ts`, installed with a `Module._load` hook) is typed against the **real** `@types/vscode`, so these tests compile exactly like production and cannot drift from the API. Added `test/harness.ts` (a small `describe`/`test` runner that owns `process.exit`, so a stray timer can never hang a build) and `test/providerFixture.ts` (builds a real `GatewayProvider` over the stub).
+- Some cases are labelled **KNOWN QUIRK**: they deliberately pin current behaviour, so changing it becomes a conscious decision instead of a silent regression. See `AGENTS.md` §6 "Test harness" for how to add a suite.
+
+## 1.2.21
+
+### New Features
+- **Open request log folder.** New command "Open Request Log Folder" (command palette) and an "Open log folder" link under the `requestLogDirectory` setting open the configured folder in the OS file explorer (creating it if missing; if no folder is set, offers to open the setting).
+
 ## 1.2.20
 
 ### New Features

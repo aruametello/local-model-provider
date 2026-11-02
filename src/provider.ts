@@ -11,13 +11,15 @@ import { buildCrashReport, writeCrashReport } from './crashLog';
 // These are only used as a last-resort fallback when a server does not report
 // a context size at all. We deliberately do NOT expose them as settings — the
 // upstream server is the source of truth for both context and output limits.
-const FALLBACK_CONTEXT_WINDOW = 32768;
+// Exported so the unit tests assert against the real values (see
+// test/providerTokenBudget.test.ts) instead of duplicating the numbers.
+export const FALLBACK_CONTEXT_WINDOW = 32768;
 // Default cap on max_tokens sent per generation when the user has not set the
 // `maxOutputTokens` setting. The actual max_tokens sent to the server is
 // bounded by this value and the model's context window. The server's own
 // max-output limit remains authoritative for how long the model may actually
 // generate.
-const DEFAULT_MAX_OUTPUT_TOKENS = 65536;
+export const DEFAULT_MAX_OUTPUT_TOKENS = 65536;
 
 /**
  * Language model provider for OpenAI-compatible inference APIs
@@ -33,9 +35,31 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   private readonly toolCallReasoning: Map<string, string> = new Map();
   // Track if we've shown the welcome notification this session
   private hasShownWelcomeNotification = false;
-  // Model cache
+  // Model cache (TTL-bounded; cleared on config change / manual refresh)
   private cachedModels: vscode.LanguageModelChatInformation[] | null = null;
   private modelCacheTimestamp: number = 0;
+  // Last known model list: the most recent non-empty list fetched from the
+  // server. Unlike the TTL cache it is NOT cleared by a manual refresh or a
+  // config change — when a fetch fails (server unreachable) or the server
+  // reports no models yet (still starting up), this list is returned instead
+  // of an empty one, so the model picker never gets stuck empty. It is
+  // persisted to globalState so it also survives an IDE restart (the IDE
+  // commonly comes up before the local server). Only replaced by a newer
+  // non-empty fetch, and only used as a fallback while the server URL still
+  // matches the one it was fetched from.
+  private lastKnownModels: vscode.LanguageModelChatInformation[] | null = null;
+  private lastKnownModelsServerUrl: string | null = null;
+  // Background recovery: while the server is not reporting a usable model
+  // list, re-fetch periodically so the picker self-heals without a manual
+  // "Refresh Models" call.
+  private modelRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  private modelRecoveryInFlight = false;
+  // Where the model list from the most recent user-facing
+  // provideLanguageModelChatInformation() call came from (commands use this
+  // to phrase accurate toasts).
+  private lastModelListSource: 'live' | 'lastKnown' | 'empty' = 'empty';
+  private static readonly LAST_KNOWN_MODELS_KEY = 'localModelProvider.lastKnownModels';
+  private static readonly MODEL_RECOVERY_INTERVAL_MS = 30000;
   // Event emitter for model list changes
   private readonly _onDidChangeLanguageModelChatInformation = new vscode.EventEmitter<void>();
   public readonly onDidChangeLanguageModelChatInformation = this._onDidChangeLanguageModelChatInformation.event;
@@ -62,10 +86,22 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         }
       })
     );
+
+    // Restore the persisted last-known model list (survives IDE restarts)
+    this.restoreLastKnownModels();
+
+    // Cancel any pending model-recovery poll on deactivation
+    context.subscriptions.push({ dispose: () => this.cancelModelRecovery() });
   }
 
   /**
-   * Clear the model cache to force a refresh
+   * Clear the TTL model cache to force a fresh fetch on the next model-list
+   * request.
+   *
+   * Note: this intentionally does NOT clear the last-known model list — a
+   * failed refresh must not leave the user without a usable model list; the
+   * fetch path falls back to `getStaleModelsFallback()` when it cannot get a
+   * fresh list.
    */
   public clearModelCache(): void {
     this.cachedModels = null;
@@ -73,6 +109,18 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     this.log('info', 'Model cache cleared');
     // Notify VS Code that the model list has changed
     this._onDidChangeLanguageModelChatInformation.fire();
+  }
+
+  /**
+   * Where the model list from the most recent user-facing
+   * `provideLanguageModelChatInformation()` call came from: 'live' (fresh
+   * server fetch or fresh cache), 'lastKnown' (the fetch failed or the
+   * server reported no models, so the last known list was kept), or 'empty'
+   * (nothing fetchable and no last known list). Commands use this to phrase
+   * accurate toasts.
+   */
+  public getLastModelListSource(): 'live' | 'lastKnown' | 'empty' {
+    return this.lastModelListSource;
   }
 
   /**
@@ -582,21 +630,50 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   }
 
   /**
-   * Provide language model information - fetches available models from inference server
+   * Provide language model information - fetches available models from inference server.
+   *
+   * Resilience: when the fetch fails (server unreachable) or the server
+   * reports no models yet (still starting up), the last known non-empty list
+   * for the current server is returned instead of an empty one, and a
+   * background recovery loop re-fetches until a live list arrives — so the
+   * model picker does not get stuck empty when the IDE comes up before the
+   * server (no manual "Refresh Models" call needed).
    */
   async provideLanguageModelChatInformation(
     options: { silent: boolean; },
     token: vscode.CancellationToken
   ): Promise<vscode.LanguageModelChatInformation[]> {
     this.log('debug', `API key configured: ${this.config.apiKey ? 'yes' : 'no'}`);
-    // Check cache first
+    const result = await this.fetchModelList(options.silent, false);
+    this.lastModelListSource = result.source;
+    return result.models;
+  }
+
+  /**
+   * Core model-list fetch, shared by the user-facing provider method and the
+   * background recovery loop.
+   *
+   * @param silent suppress the user-facing error toast when the fetch fails
+   * @param force  ignore the TTL cache and always hit the server (recovery
+   *               must never be served a stale cache)
+   * @returns the model list plus its source: 'live' (fresh fetch or fresh
+   *               cache), 'lastKnown' (fallback to the last known list) or
+   *               'empty' (no usable list)
+   */
+  private async fetchModelList(
+    silent: boolean,
+    force: boolean
+  ): Promise<{ models: vscode.LanguageModelChatInformation[]; source: 'live' | 'lastKnown' | 'empty' }> {
+    // Check cache first (skipped when forcing a fresh fetch)
     const now = Date.now();
     if (this.cachedModels && this.config.modelCacheTtlMs > 0 && 
         (now - this.modelCacheTimestamp) < this.config.modelCacheTtlMs) {
       this.log('debug', `Using cached models (${this.cachedModels.length} models, cache age: ${now - this.modelCacheTimestamp}ms)`);
-      return this.cachedModels;
+      return { models: this.cachedModels, source: 'live' };
     }
 
+    let models: vscode.LanguageModelChatInformation[] | null = null;
+    let fetchError: string | null = null;
     try {
       this.log('info', 'Fetching models from inference server...');
       const [response, ollamaCaps] = await Promise.all([
@@ -606,7 +683,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
       const visionOverrides = this.config.visionModels ?? [];
 
-      const models = response.data.map((model) => {
+      models = response.data.map((model) => {
         const imageInput = this.detectVision(model.id, model, ollamaCaps, visionOverrides);
         // Use the per-model context window reported by the server (e.g. llama.cpp
         // --ctx-size / context_length override) when available; otherwise fall back
@@ -645,23 +722,35 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       // /v1/models endpoint provides them — no client-side reordering. (The
       // `defaultModel` setting existed briefly in 1.2.9 and was removed in 1.2.10;
       // do not reintroduce it or any preference-based ordering.)
+    } catch (error) {
+      fetchError = error instanceof Error ? error.message : String(error);
+      this.log('error', `Failed to fetch models: ${fetchError}`);
+    }
 
-      // Update cache
+    // --- Live, non-empty list: update cache + last-known list, stop recovery ---
+    if (models && models.length > 0) {
       this.cachedModels = models;
       this.modelCacheTimestamp = now;
+      this.rememberLastKnownModels(models);
+      this.cancelModelRecovery();
 
       const visionCount = models.filter(m => m.capabilities?.imageInput).length;
       this.log(
         'info',
         `Found ${models.length} models (${visionCount} with image input): ${models.map(m => `${m.id}[${m.maxInputTokens}+${m.maxOutputTokens}]`).join(', ')}`
       );
-      return models;
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      this.log('error', `Failed to fetch models: ${errorMessage}`);
-      if (!options.silent) {
+      return { models, source: 'live' };
+    }
+
+    // --- No usable live list: fall back to the last known list, and keep
+    //     polling in the background so the picker self-heals once the server
+    //     starts reporting models again (IDE came up before the server). ---
+    const fallback = this.getStaleModelsFallback();
+    if (models === null) {
+      // Fetch failed (server unreachable / error response)
+      if (!silent && fetchError) {
         vscode.window.showErrorMessage(
-          `Local Model Provider: Failed to fetch models. ${errorMessage}`,
+          `Local Model Provider: Failed to fetch models. ${fetchError}`,
           'Open Settings'
         ).then((selection: string | undefined) => {
           if (selection === 'Open Settings') {
@@ -669,9 +758,140 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
           }
         });
       }
-
-      return [];
+      if (fallback) {
+        this.log('warn', `Keeping the last known list (${fallback.length} models) because the fetch failed`);
+      }
+    } else if (fallback) {
+      // models === [] — server responded but reports no models yet (still loading)
+      this.log('warn', `Server reported 0 models; keeping the last known list (${fallback.length} models)`);
+    } else {
+      this.log('info', 'Server reported no models.');
     }
+
+    this.scheduleModelRecovery();
+    if (fallback) {
+      return { models: fallback, source: 'lastKnown' };
+    }
+    return { models: [], source: 'empty' };
+  }
+
+  /**
+   * The last known model list, but only when it belongs to the current
+   * server. A list fetched from a different server URL is never used as a
+   * fallback (it would leak that server's models into the picker).
+   */
+  private getStaleModelsFallback(): vscode.LanguageModelChatInformation[] | null {
+    if (!this.lastKnownModels || this.lastKnownModels.length === 0) {
+      return null;
+    }
+    if (this.lastKnownModelsServerUrl && this.lastKnownModelsServerUrl !== this.config.serverUrl) {
+      this.log(
+        'debug',
+        `Last known model list (${this.lastKnownModels.length} models) belongs to ${this.lastKnownModelsServerUrl}, not the current server ${this.config.serverUrl}; no fallback`
+      );
+      return null;
+    }
+    return this.lastKnownModels;
+  }
+
+  /**
+   * Remember a freshly fetched non-empty model list as the new last-known
+   * list, and persist it so it survives an IDE restart (the IDE commonly
+   * comes up before the local inference server).
+   */
+  private rememberLastKnownModels(models: vscode.LanguageModelChatInformation[]): void {
+    this.lastKnownModels = models;
+    this.lastKnownModelsServerUrl = this.config.serverUrl;
+    const payload = { serverUrl: this.config.serverUrl, models };
+    Promise.resolve(this.context.globalState.update(GatewayProvider.LAST_KNOWN_MODELS_KEY, payload))
+      .catch((error: unknown) => {
+        this.log('warn', `Failed to persist last known model list: ${error instanceof Error ? error.message : String(error)}`);
+      });
+  }
+
+  /**
+   * Restore the persisted last known model list (constructor only). Only
+   * trusted when it was fetched from the same server URL the extension is
+   * currently pointing at.
+   */
+  private restoreLastKnownModels(): void {
+    try {
+      const stored = this.context.globalState.get<{ serverUrl?: string; models?: unknown }>(GatewayProvider.LAST_KNOWN_MODELS_KEY);
+      if (!stored || !Array.isArray(stored.models) || stored.models.length === 0) {
+        return;
+      }
+      if (stored.serverUrl && stored.serverUrl !== this.config.serverUrl) {
+        this.log('debug', `Ignoring persisted model list (fetched from ${stored.serverUrl}; now pointing at ${this.config.serverUrl})`);
+        return;
+      }
+      const models = stored.models.filter(
+        (m): m is vscode.LanguageModelChatInformation =>
+          !!m && typeof m === 'object' && typeof (m as { id?: unknown }).id === 'string'
+      );
+      if (models.length === 0) {
+        return;
+      }
+      this.lastKnownModels = models;
+      this.lastKnownModelsServerUrl = stored.serverUrl ?? this.config.serverUrl;
+      this.log('info', `Restored last known model list (${models.length} models) from global state`);
+    } catch (error) {
+      this.log('warn', `Failed to restore last known model list: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * Schedule a background model-list recovery attempt (at most one pending
+   * at a time). Called whenever a fetch failed or the server reported no
+   * models.
+   */
+  private scheduleModelRecovery(): void {
+    if (this.modelRecoveryTimer) {
+      return;
+    }
+    this.modelRecoveryTimer = setTimeout(() => {
+      this.modelRecoveryTimer = null;
+      void this.attemptModelRecovery();
+    }, GatewayProvider.MODEL_RECOVERY_INTERVAL_MS);
+    // The recovery poll must not keep the extension host process alive
+    (this.modelRecoveryTimer as { unref?: () => void }).unref?.();
+  }
+
+  private cancelModelRecovery(): void {
+    if (this.modelRecoveryTimer) {
+      clearTimeout(this.modelRecoveryTimer);
+      this.modelRecoveryTimer = null;
+    }
+  }
+
+  /**
+   * One background recovery attempt: force a fresh fetch (never served from
+   * the cache, never shows a toast). On a live non-empty list, fire the
+   * change event so VS Code refreshes the model picker automatically, and
+   * stop recovering. Otherwise schedule the next attempt.
+   */
+  private async attemptModelRecovery(): Promise<void> {
+    if (this.modelRecoveryInFlight) {
+      // Another attempt is running; it will schedule the next one on failure
+      return;
+    }
+    this.modelRecoveryInFlight = true;
+    try {
+      this.log('debug', 'Model recovery: re-fetching model list from inference server...');
+      const result = await this.fetchModelList(true, true);
+      if (result.source === 'live' && result.models.length > 0) {
+        this.log('info', `Model recovery: server is reporting models again (${result.models.length} models)`);
+        // Tell VS Code the model list changed so the picker self-heals
+        this._onDidChangeLanguageModelChatInformation.fire();
+        return;
+      }
+      this.log('debug', 'Model recovery: server still not reporting models; will retry');
+    } catch (error) {
+      // fetchModelList never throws, but never let a recovery bug crash the host
+      this.log('debug', `Model recovery: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      this.modelRecoveryInFlight = false;
+    }
+    this.scheduleModelRecovery();
   }
 
   /**
@@ -738,7 +958,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       /bakllava/i,
       /internvl/i,
       /phi-?3.*vision/i,
-      /-v[0-9]/i,         // e.g. "smolvlm", less reliable but low risk
+      /smolvlm/i,         // HuggingFace SmolVLM family
+      /-v\d+b/i,          // e.g. "foo-v32b" style vision suffixes, less reliable but low risk
     ];
     return heuristicPatterns.some((re) => re.test(normalizedId));
   }
@@ -1876,12 +2097,18 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       cfg.requestTimeout = 60000;
     }
 
-    // Validate serverUrl format
+    // Validate serverUrl format. `new URL()` alone is not enough: WHATWG
+    // parsing accepts scheme-less values like "localhost:8000" (treating
+    // "localhost" as the scheme), which would build bogus request URLs.
+    // Require an absolute http(s) URL.
     try {
-      new URL(cfg.serverUrl);
+      const parsed = new URL(cfg.serverUrl);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw new Error(`unsupported protocol "${parsed.protocol}"`);
+      }
     } catch {
-      this.log('error', ` Invalid server URL: ${cfg.serverUrl}`);
-      throw new Error(`Invalid server URL: ${cfg.serverUrl}`);
+      this.log('error', ` Invalid server URL: ${cfg.serverUrl} (must be an absolute http:// or https:// URL)`);
+      throw new Error(`Invalid server URL: ${cfg.serverUrl}. It must be an absolute URL starting with http:// or https://`);
     }
 
     return cfg;

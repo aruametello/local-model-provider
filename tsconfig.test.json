@@ -3,12 +3,16 @@
   "compilerOptions": {
     "outDir": "out-test",
     "rootDir": ".",
-    "types": ["node"]
+    "types": ["node", "vscode"]
   },
   "include": [
     "src/qwenXml.ts",
-      "src/charUtils.ts",
-      "src/requestLog.ts",
-      "test/**/*.ts"
-    ]
+    "src/charUtils.ts",
+    "src/requestLog.ts",
+    "src/client.ts",
+    "src/statistics.ts",
+    "src/crashLog.ts",
+    "src/provider.ts",
+    "test/**/*.ts"
+  ]
 }

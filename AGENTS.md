@@ -50,7 +50,11 @@ VS Code context-window meter via the `'usage'` data part).
 it with VS Code under vendor id `custom-local-model-provider`. When Copilot asks for models,
 `provideLanguageModelChatInformation()` calls the server's `/v1/models` (+ Ollama
 `/api/tags`) and returns `LanguageModelChatInformation[]` including detected
-capabilities (`toolCalling`, `imageInput`). Each model's context window comes from
+capabilities (`toolCalling`, `imageInput`). If that fetch fails or the server
+reports no models yet (IDE came up before the server), the **last known model
+list** (persisted to `globalState`, only valid for the same `serverUrl`) is
+returned instead, and a 30-second background poll restores the live list
+automatically — the picker must never get stuck empty (1.2.22). Each model's context window comes from
 server metadata (`GatewayClient.extractContextLength`, e.g. llama.cpp `status.args`),
 falling back to a built-in `FALLBACK_CONTEXT_WINDOW` constant (the `defaultMaxTokens`
 and `defaultMaxOutputTokens` settings were removed — the upstream server is the source
@@ -65,9 +69,9 @@ streams the completion back through `client.streamChatCompletion()`, and reports
 
 | File | Role | Notes |
 |------|------|-------|
-| `src/extension.ts` | Activation, command registration (showStatus, selectModel, switchServer, showStats, refreshModels), status bar wiring | Commands call into `provider` / `statusBar` / `statsManager`. Preset switching updates config then calls `provider.applyLatestConfiguration()` + `clearModelCache()`. `selectModel` is browse-only (models in server order — the `defaultModel` setting was removed in 1.2.10). Activation runs a one-time cleanup that deletes any leftover `defaultModel` value from user/workspace settings.json. The API key is a plain `local.model.provider.apiKey` setting (editable inline in the Settings UI next to `serverUrl`), not a command. |
-| `src/provider.ts` | **Core.** `GatewayProvider implements vscode.LanguageModelChatProvider` | Message conversion, token estimation/truncation, tool-call handling (incl. JSON repair), Qwen XML tool-call compat, vision detection + image forwarding, reasoning salvage + final-answer retry (`retryFinalAnswer`), model caching. |
-| `src/client.ts` | `GatewayClient`: HTTP with retry/backoff/jitter, SSE streaming parser for `/v1/chat/completions`, `/v1/models` fetch, Ollama `/api/tags` capability probe | Yields chunks `{ content, reasoning_content?, tool_calls, finished_tool_calls, finish_reason?, usage? }`. Tool calls accumulate **by index** during streaming (ids may arrive late). Injects `stream_options: { include_usage: true }` when `includeUsageInStream` is set; the trailing usage chunk arrives with an **empty `choices` array**, so `parseSSEData` must capture `usage` independently of delta/message. `fetch`/`fetchWithRetry` accept a `CancellationToken` and abort the request on cancel (TCP teardown); `sleepCancellable` short-circuits retry backoff. **`isRetryableError` walks the `error.cause` chain and checks `error.code`** so Node's `TypeError: fetch failed` (with `ECONNREFUSED`/`ETIMEDOUT`/`ECONNRESET` nested in `cause`) is retried. **`readWithIdleTimeout`** races each stream read against `requestTimeout` so a server that stalls mid-stream (after headers) is aborted with a retryable `GatewayError` instead of hanging. **`extractContextLength(model)`** (static) parses a model's effective context window from llama.cpp `status.args` (`--override-kv ...context_length=int:<n>` wins over `--ctx-size <n>`); returns `undefined` when absent so callers fall back to a built-in `FALLBACK_CONTEXT_WINDOW` (no `defaultMaxTokens` setting anymore). **`sanitizeLoneSurrogates()`** (module-level function) is applied via the `JSON.stringify(body, replacer)` replacer in `streamChatCompletion` — it replaces any unpaired UTF-16 surrogate half in outgoing string values with U+FFFD before the request body is serialized. This is the single choke point for the outgoing HTTP body; keep it if you ever add a second request-building path. **API key:** `GatewayConfig.apiKey` is read directly from the `local.model.provider.apiKey` setting in `loadConfig()` (that setting appears in the Settings UI right next to `serverUrl`); empty value = no `Authorization` header sent. |
+| `src/extension.ts` | Activation, command registration (showStatus, selectModel, switchServer, showStats, refreshModels, openRequestLogFolder), status bar wiring | Commands call into `provider` / `statusBar` / `statsManager`. Preset switching updates config then calls `provider.applyLatestConfiguration()` + `clearModelCache()`. `selectModel` is browse-only (models in server order — the `defaultModel` setting was removed in 1.2.10). Activation runs a one-time cleanup that deletes any leftover `defaultModel` value from user/workspace settings.json. The API key is a plain `local.model.provider.apiKey` setting (editable inline in the Settings UI next to `serverUrl`), not a command. `openRequestLogFolder` (1.2.21) opens `requestLogDirectory` via `vscode.env.openExternal`; it is also linked from that setting's `markdownDescription` (`command:` link, since the Settings UI has no native button). |
+| `src/provider.ts` | **Core.** `GatewayProvider implements vscode.LanguageModelChatProvider` | Message conversion, token estimation/truncation, tool-call handling (incl. JSON repair), Qwen XML tool-call compat, vision detection + image forwarding, reasoning salvage + final-answer retry (`retryFinalAnswer`), model caching. **Model-list resilience (1.2.22+):** `provideLanguageModelChatInformation` is a thin wrapper over `fetchModelList(silent, force)`. On fetch failure or a 0-model response it falls back to `getStaleModelsFallback()` (the `lastKnownModels` list — persisted to `globalState` under `localModelProvider.lastKnownModels` with the `serverUrl` it was fetched from, only reused while the URL matches) and calls `scheduleModelRecovery()`; the recovery loop (`attemptModelRecovery`, 30 s poll, `unref()`-ed, in-flight guard) force-refetches and fires `_onDidChangeLanguageModelChatInformation` on success so the picker self-heals without a manual refresh. `clearModelCache()` clears ONLY the TTL cache — never the last-known list. `getLastModelListSource()` ('live'/'lastKnown'/'empty') lets commands phrase accurate toasts. |
+| `src/client.ts` | `GatewayClient`: HTTP with retry/backoff/jitter, SSE streaming parser for `/v1/chat/completions`, `/v1/models` fetch, Ollama `/api/tags` capability probe | Yields chunks `{ content, reasoning_content?, tool_calls, finished_tool_calls, finish_reason?, usage? }`. Tool calls accumulate **by index** during streaming (ids may arrive late). Injects `stream_options: { include_usage: true }` when `includeUsageInStream` is set; the trailing usage chunk arrives with an **empty `choices` array**, so `parseSSEData` must capture `usage` independently of delta/message. `fetch`/`fetchWithRetry` accept a `CancellationToken` and abort the request on cancel (TCP teardown); `sleepCancellable` short-circuits retry backoff. **`isRetryableError` walks the `error.cause` chain (with a visited-set guard, so a cyclic `cause` chain terminates instead of spinning forever) and checks `error.code`** so Node's `TypeError: fetch failed` (with `ECONNREFUSED`/`ETIMEDOUT`/`ECONNRESET` nested in `cause`) is retried. When `fetchWithRetry` gives up after exhausting retries it **carries the real retryability classification** into the final `GatewayError` (a network failure that ran out of retries stays `isRetryable: true`) — do not hard-code `false` there again. **`readWithIdleTimeout`** races each stream read against `requestTimeout` so a server that stalls mid-stream (after headers) is aborted with a retryable `GatewayError` instead of hanging. **`extractContextLength(model)`** (static) parses a model's effective context window from llama.cpp `status.args` (`--override-kv ...context_length=int:<n>` wins over `--ctx-size <n>`); returns `undefined` when absent so callers fall back to a built-in `FALLBACK_CONTEXT_WINDOW` (no `defaultMaxTokens` setting anymore). **`sanitizeLoneSurrogates()`** (module-level function) is applied via the `JSON.stringify(body, replacer)` replacer in `streamChatCompletion` — it replaces any unpaired UTF-16 surrogate half in outgoing string values with U+FFFD before the request body is serialized. This is the single choke point for the outgoing HTTP body; keep it if you ever add a second request-building path. **API key:** `GatewayConfig.apiKey` is read directly from the `local.model.provider.apiKey` setting in `loadConfig()` (that setting appears in the Settings UI right next to `serverUrl`); the key is **trimmed where it is used** (`getHeaders`) — an empty or whitespace-only value sends no `Authorization`/`x-api-key` header at all. |
 | `src/types.ts` | All shared interfaces: `OpenAIModel`, `OpenAIMessage`, request/response/chunk types, `OllamaModelCapabilities`, `GatewayConfig` | Keep in sync with what `client.ts` sends/reads and what `loadConfig()` fills. `OpenAIModel` carries optional `status.args` (llama.cpp launch args) and `contextLength` (parsed effective context window). |
 | `src/secrets.ts` | _(removed in 1.2.20)_ — the per-server `SecretManager`/SecretStorage key system was replaced by the plain `local.model.provider.apiKey` settings field. | |
 | `src/statusBar.ts` | Status bar item (`$(plug)/$(check)/$(error)` "Local LLM"), quick-pick status menu, server presets UI types (`ServerPreset`, `ServerStatus`) | |
@@ -79,6 +83,17 @@ streams the completion back through `client.streamChatCompletion()`, and reports
 | `test/qwenXml.test.ts` | Plain Node test runner for `qwenXml` (no framework) | Run via `npm test`. |
 | `test/requestLog.test.ts` | Plain Node test for `requestLog` (temp dir, pruning order, size cap, concurrency) | Run via `npm test`. |
 | `test/charHandling.test.ts` | Plain Node test runner for the character-handling fixes: `qwenXml` embedded-tag parsing, `truncateToCodePoints`, surrogate sanitization, string-aware JSON repair (no framework) | Run via `npm test`. **`npm test` runs BEFORE every build** — `prebuild`/`prepackage` hooks in `package.json` invoke it, so a regression fails the build. |
+| `test/harness.ts` | Minimal `describe`/`test`/`run()` runner for the newer suites (no framework) | Prints one char per case, then every failure with the first `src`/`test` stack frame. `run()` calls `process.exit()` explicitly so a stray timer can never hang `npm test`. |
+| `test/vscodeRuntime.ts` | **Runtime stub for the `vscode` module** + the `Module._load` hook that installs it + shared helpers | Types still come from the real `@types/vscode` (`"types": ["node","vscode"]` in `tsconfig.test.json`), so a test can never drift from the API production compiles against. The stub covers what the code touches: `window` (incl. `withProgress` + recording output channel), `workspace.getConfiguration`/`onDidChangeConfiguration`/`fs` (real temp dir), `commands`, `env`, `lm`, `Uri`, `EventEmitter`, `CancellationTokenSource`, and the duck-typed part classes. Helpers: `resetStub`/`setConfig`/`getConfig`/`getOutputLines`/`getNotifications`/`setNextMessageAnswer`/`fireConfigurationChange`/`setGlobalState`/`makeTempDir`/`createContext`/`withoutPartClass`, plus `invoke`/`readPrivate`/`writePrivate` for private members. |
+| `test/providerFixture.ts` | Builds a **real** `GatewayProvider` on top of the stub | `createProvider(overrides, globalState)`, `serverModel(id)`, `stubClient(provider, {models, ollama, chat})` → `{ calls, bodies }` (replaces `provider.client`), `progressSink()`, `fakeToken()`. Defaults mirror `loadConfig()`: `logLevel: 'error'`, `modelCacheTtlMs: 0` (no cached fake timers). |
+| `test/client.test.ts` | `client.ts` wire layer (60 cases) | `extractContextLength`, `sanitizeLoneSurrogates`, `isRetryableError`, `calculateBackoffDelay`, index-based tool-call accumulation, `processSSELine`, `getHeaders`, `fetchModels`/`fetchOllamaCapabilities` (fake `globalThis.fetch`), and end-to-end `streamChatCompletion` over a real `ReadableStream`: TCP-boundary reassembly, CRLF, trailing `usage` chunk, tool calls, surrogate sanitization *on the wire*, drop-before-data (error) vs drop-after-data (treated as end-of-stream), invalid UTF-8. |
+| `test/tokenBudget.test.ts` | Context/token budgeting (32 cases) | Pins the AGENTS.md invariants: `splitContextWindow` input+output === window, `calculateSafeMaxOutputTokens` returns `undefined` when the input fills the window, `getModelContextWindow` recovers the full window, images cost a fixed placeholder (base64 never counted), `pruneOrphanedToolMessages`, `truncateMessagesToFit`. |
+| `test/messages.test.ts` | VS Code part → OpenAI message conversion (41 cases) | `mapRole` (incl. duck-typed `System`), tool-call/tool-result parts (+ Qwen continue hint), `extractImageContentPart`, `processPartDuckTyped` (missing class → skipped, not thrown), `convertSingleMessageWithLogging`, `getDefaultForType`, `fillMissingRequiredProperties`, `buildToolsConfig`, `processToolCall`. |
+| `test/jsonRepair.test.ts` | String-aware JSON repair (20 cases) | `countCharOutsideStrings`, `countQuotesOutsideEscapes`, `balanceBrackets`, `tryRepairJson` — brackets inside string literals must not be counted. |
+| `test/modelList.test.ts` | Config loading + model listing + error surfacing (35 cases) | `loadConfig` (`/v1` strip, validation — serverUrl must be an absolute http(s) URL — and clamping), config-change reload + cache invalidation, all four `detectVision` layers, server-order listing with per-model context split, TTL cache, last-known fallback (and its server-URL isolation), `handleChatError`. |
+| `test/statistics.test.ts` | `RecordStats` + `StatsManager` (34 cases) | Token/record clamping, computed getters, the `onStatsUpdate` contract (fires once per mutation, not on reads), `formatTokens`/`formatDuration` incl. their zero-boundary quirks. |
+| `test/crashLog.test.ts` | `buildCrashReport` / `writeCrashReport` (31 cases) | Header/sections, every redaction pattern (API keys, bearer tokens, base64 image payloads, malformed input), and the never-throw contract — `console.error` is captured and asserted because the module's job is to *record* a failure, not hide it. |
+| `test/outputFidelity.test.ts` | **Model output must never be mangled** (11 cases) | End-to-end through the REAL provider + REAL client over a faked `fetch` returning scripted SSE bytes: backslash-dense Windows scripts (paths, PowerShell, literal `\n`/`\"` sequences) round-trip character-for-character, including wire slices that split escape sequences and 4-byte emoji mid-character; hand-built JSON escapes decode exactly right; tool-call arguments keep escaped backslashes/quotes; lone surrogates arriving from a server pass through untouched (sanitization is outgoing-only); Qwen-XML compat neither rewrites backslash-heavy prose nor corrupts XML parameters. |
 | `docs/API.md` | Internal architecture docs (partially historical — verify against code before trusting) | |
 | `package.json` | Manifest: contributes commands + all `local.model.provider.*` settings; build scripts. `name` is `local-model-provider-custom` (fork id, coexists with the official extension); `displayName` is "(custom) Local Model Provider" | **Every new setting must be added here AND to `GatewayConfig` + `loadConfig()`.** Contributed command ids follow the `local-model-provider-custom.*` namespace — if you rename the `name` field again, update them in `package.json`, `extension.ts`, and `statusBar.ts` (and the model `family` in `provider.ts`). |
 | `install_build/` | **Portable Windows installer folder** — copy the whole folder to any machine and double-click `install.bat` | Contains `install.bat` (finds VS Code CLI on PATH or in standard install dirs, runs `code --install-extension`), a **bundled `local-model-provider-custom-<version>.vsix`**, and a short `README.md`. The vsix here is the *distributable artifact* — it is git-tracked via the `!install_build/*.vsix` exception in `.gitignore`. **Must be refreshed on every release** (see §6). |
@@ -160,7 +175,7 @@ provideLanguageModelChatResponse(model, messages, options, progress, token)
 - **Capability detection is layered** (`GatewayProvider.detectVision`): user override
   setting `visionModels` → Ollama `/api/tags` `"vision"` entry (tolerant of `name:tag`)
   → opportunistic model-object fields (`capabilities[]`, `architecture.input_modalities`)
-  → id heuristics (`-vl`, `llava`, `minicpm-v`, `gemma3`, …). Preserve this order.
+  → id heuristics (`-vl`, `llava`, `minicpm-v`, `gemma3`, `smolvlm`, …). Preserve this order.
 - **Never count base64 in token estimates.** Use `extractEstimableText()`; images cost a
   fixed `ESTIMATED_IMAGE_TOKENS` (150) budget.
 - **Server compatibility first.** OpenAI-compatible servers vary wildly: **never send
@@ -192,6 +207,17 @@ provideLanguageModelChatResponse(model, messages, options, progress, token)
 - **Model cache:** `cachedModels` + TTL (`modelCacheTtlMs`, default 5 min). Clear on
   config change, API-key refresh, and server switch. Fire
   `_onDidChangeLanguageModelChatInformation` when clearing externally.
+- **Keep the last-known model list when the server is not ready (1.2.22+).** The
+  picker must never get stuck empty (the IDE commonly starts before the local
+  server): `fetchModelList()` returns `getStaleModelsFallback()` — the last
+  non-empty list, only when fetched from the same `serverUrl` — on fetch failure
+  OR a 0-model response, and always calls `scheduleModelRecovery()`. The
+  recovery loop (30 s) force-refetches (`force: true` ignores the TTL cache) and
+  fires the change event on success. Do NOT make manual "Refresh Models" the
+  only way out of an empty picker; do NOT let `clearModelCache()` or the config
+  watcher wipe `lastKnownModels` (only a newer non-empty fetch replaces it,
+  including the `globalState` entry); never use a list fetched from a different
+  server URL as a fallback.
 - **Report token usage with the `'usage'` mime data part.** VS Code feeds the chat
   context-window meter (and conversation compaction) from a `LanguageModelDataPart`
   with `mimeType === 'usage'` whose payload is an OpenAI-shaped JSON object
@@ -221,7 +247,7 @@ provideLanguageModelChatResponse(model, messages, options, progress, token)
 ```powershell
 npm install                 # dev deps (esbuild, typescript, @types/vscode, vsce)
 npx tsc -p ./ --noEmit      # type-check (expect exit 0; a pre-existing moduleResolution deprecation warning in tsconfig.json is NOT an error)
-npm test                    # compiles tsconfig.test.json + runs qwenXml + charHandling + requestLog tests (plain node, no framework)
+npm test                    # compiles tsconfig.test.json then runs every suite (plain node, no framework) — see "Test harness" below
 npm run esbuild             # bundle src/extension.ts -> out/extension.js (+sourcemap); runs `npm test` first via prebuild hook
 npm run package             # vsce package -> local-model-provider-custom-<version>.vsix; runs `npm test` first via prepackage hook
 code --install-extension .\local-model-provider-custom-<version>.vsix   # install into the user's VS Code
@@ -232,6 +258,30 @@ code --install-extension .\local-model-provider-custom-<version>.vsix   # instal
 `npm run package` fail fast if a unit test regresses. If you add a new pure
 helper, add a test to `test/charHandling.test.ts` (or a new `test/*.test.ts`
 file and wire it into the `test` script).
+
+**Test harness (how `src/` code that imports `vscode` is unit-tested).**
+`tsconfig.test.json` extends the production config, adds
+`"types": ["node", "vscode"]`, and compiles `qwenXml`, `charUtils`, `requestLog`,
+`client`, `statistics`, `crashLog`, `provider` plus `test/**` into `out-test/`.
+Type-checking uses the **real** `@types/vscode` (so tests can't drift from the
+API production compiles against), and at *runtime* `test/vscodeRuntime.ts`
+patches `Module._load` so `require('vscode')` returns the stub from
+`test/vscodeRuntime.ts`. Rules for adding a suite:
+
+1. The file must `import './vscodeRuntime';` (or `from './providerFixture'`, which
+   imports it first) **before** any `../src/...` import — TypeScript emits
+   `require` calls in source order, so a later import would load the real module.
+2. End the file with `void run();` and only ever call it once (the runner owns
+   `process.exit`).
+3. To test another `src/` file, add it to `include` in `tsconfig.test.json`;
+   the stub only implements what existing suites need, so extend it when a new
+   API surface is touched.
+4. `target`/`lib` are inherited from `tsconfig.json` (ES2021): no top-level
+   `await`, no `.at()`, no `new Error(msg, { cause })` — use
+   `Object.assign(err, { cause })`.
+5. Several cases are labelled **KNOWN QUIRK** — they deliberately pin today's
+   behaviour (documented in the test) so a future fix is a conscious change
+   rather than a silent regression. They are not endorsements of the behaviour.
 
 **Release workflow after any code change:**
 1. Bump `version` in `package.json`.
@@ -378,17 +428,37 @@ Notes:
   opener directly preceded by a backtick, and `hasRawToolCallMarkup` strips
   single-line inline-code spans first. Do NOT go back to a first-open/first-close
   regex.
+- **`new URL()` is NOT a serverUrl validator (1.2.23).** WHATWG parsing happily
+  accepts the classic user typo `localhost:8000` — it reads `localhost:` as the
+  *scheme* — so a bare `new URL()` try/catch let it through and every request
+  then failed with a confusing upstream error. `loadConfig` now also requires
+  `protocol` to be `http:`/`https:`. Keep that check when touching URL
+  validation; `test/modelList.test.ts` pins it (plus `ftp://`/`file://`
+  rejection).
+- **Error `cause` chains can be cyclic (1.2.23).** Third-party code (and
+  `AggregateError`-style wrappers) may produce `a.cause = b; b.cause = a`. Any
+  loop walking `error.cause` — `isRetryableError` is the one here — MUST keep a
+  visited set, or the retry path spins forever with no timeout and no error.
+  Do not "simplify" the guard away.
+- **Model-id vision heuristics are literal-name matches, not intentions.** The
+  old list *commented* that `/-v[0-9]/i` covered "smolvlm" — it never did, and
+  it mis-flagged ordinary version suffixes (`my-model-v2`) as vision. SmolVLM
+  now has its own `smolvlm` pattern and the loose fallback is `-v\d+b`. When
+  adding a family, add an explicit pattern AND a case in the `detectVision`
+  block of `test/modelList.test.ts`; a comment is not a regex.
 
 ## 8. Change checklist (do ALL that apply per change)
 
 - [ ] Code change compiles: `npx tsc -p ./ --noEmit` → exit 0
 - [ ] Tests pass: `npm test` (runs automatically before `esbuild`/`package` via `prebuild`/`prepackage` hooks)
 - [ ] New pure string/parsing helper? → put it in `charUtils.ts`/`qwenXml.ts` (vscode-free) and add tests to `test/charHandling.test.ts` (or a new `test/*.test.ts` wired into the `test` script)
+- [ ] New suite for code that imports `vscode`? → import `./vscodeRuntime` (or `./providerFixture`) **before** any `../src/...` import, add the `src/` file to `tsconfig.test.json`'s `include`, extend the stub in `test/vscodeRuntime.ts` for any API it doesn't fake yet, wire the suite into the `test` script, and end the file with `void run();` (see §6 "Test harness")
 - [ ] New/changed setting? → `package.json` + `GatewayConfig` + `loadConfig()` (3 places). Never reintroduce the removed `defaultMaxTokens`/`defaultMaxOutputTokens` settings — use the `FALLBACK_CONTEXT_WINDOW`/`DEFAULT_MAX_OUTPUT_TOKENS` constants and the `maxOutputTokens` setting in `provider.ts`
 - [ ] New server-side behavior? → extend `client.ts` (+ `types.ts`), keep retry/compat rules
 - [ ] Model capability change? → update `detectVision`; per-model `extractContextLength` + `splitContextWindow` (input+output must sum to real n_ctx); request path uses `getModelContextWindow()` not `maxInputTokens` alone
 - [ ] Context-window / token-budget change? → keep the per-model lookup (`model.maxInputTokens` from `GatewayClient.extractContextLength`); don't revert to a single global `defaultMaxTokens` setting. `calculateSafeMaxOutputTokens` returns `undefined` (omit `max_tokens`) when input fills the window — don't force a 64 floor. The output budget is bounded by the configurable `maxOutputTokens` setting (default 64k) and half of `modelMaxContext` — do not reintroduce a hard `DEFAULT_OUTPUT_BUDGET` cap on `max_tokens`, or long generations on large-context models get cut short at `finish_reason=length`.
 - [ ] Truncation change? → keep `pruneOrphanedToolMessages` so tool-call/tool-result pairs stay valid after dropping middle messages
+- [ ] Model-list fetch / resilience change? → keep the last-known-list fallback + 30 s background recovery in `provider.ts` (`fetchModelList` / `getStaleModelsFallback` / `scheduleModelRecovery` / `rememberLastKnownModels`); the fallback is only valid for the same `serverUrl`, and `clearModelCache()` must not wipe it
 - [ ] Version bump + `CHANGELOG.md` entry
 - [ ] Rebuild + repackage + reinstall (`esbuild` → `package` → `code --install-extension`)
 - [ ] Portable installer refreshed: new vsix copied into `install_build/`, `VSIX=` line in `install.bat` matches the version
