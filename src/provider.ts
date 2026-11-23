@@ -193,10 +193,37 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   }
 
   /**
+   * Flatten tool result content to the plain text the model should read.
+   * VS Code hands `content` as an array of parts; `JSON.stringify` on it emits the
+   * marshalled form (`[{"$mid":21,"value":"..."}]`), so the model saw newlines as
+   * `\n`, quotes as `\"` and doubled backslashes, and copied them into edits.
+   * Text parts (anything with a string `value`) are joined verbatim; only parts
+   * with no text form fall back to JSON.
+   */
+  private toolResultContentToText(content: unknown): string {
+    if (typeof content === 'string') {
+      return content;
+    }
+    const parts = Array.isArray(content) ? content : [content];
+    return parts
+      .map((p) => {
+        if (typeof p === 'string') {
+          return p;
+        }
+        const value = (p as { value?: unknown } | null)?.value;
+        if (typeof value === 'string') {
+          return value;
+        }
+        return JSON.stringify(p) ?? '';
+      })
+      .join('');
+  }
+
+  /**
    * Convert a tool result part to OpenAI format
    */
   private convertToolResultPart(part: vscode.LanguageModelToolResultPart): Record<string, unknown> {
-    const content = typeof part.content === 'string' ? part.content : JSON.stringify(part.content);
+    const content = this.toolResultContentToText(part.content);
     return {
       tool_call_id: part.callId,
       role: 'tool',
@@ -975,7 +1002,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     const anyPart = part as Record<string, unknown>;
     if ('callId' in anyPart && 'content' in anyPart && !('name' in anyPart)) {
       this.outputChannel.appendLine(`  Found tool result (duck-typed): callId=${anyPart.callId}`);
-      const content = typeof anyPart.content === 'string' ? anyPart.content : JSON.stringify(anyPart.content);
+      const content = this.toolResultContentToText(anyPart.content);
       toolResults.push({
         tool_call_id: anyPart.callId,
         role: 'tool',

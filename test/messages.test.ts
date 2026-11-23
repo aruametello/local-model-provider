@@ -105,10 +105,35 @@ describe('convertToolResultPart', () => {
     });
   });
 
-  test('serialises structured (non-string) result content', () => {
-    withProvider({}, (provider) => {
+  test('flattens text parts to plain text, without the marshalled JSON envelope', () => {
+    withProvider({ qwenToolLoopCompat: false }, (provider) => {
+      const raw = 'File c:\\devkit\\x.jsx updated.\r\nlinha "citada" com órgão ✓\n<shellId: 1>';
+      const part = new LanguageModelToolResultPart('c', [new LanguageModelTextPart(raw)]);
+      const out = invoke<Record<string, string>>(provider, 'convertToolResultPart', part);
+      assert.equal(out.content, raw);
+      assert.ok(!out.content.includes('$mid'), 'no VS Code marshalling envelope');
+    });
+  });
+
+  test('joins several text parts in order', () => {
+    withProvider({ qwenToolLoopCompat: false }, (provider) => {
+      const part = new LanguageModelToolResultPart('c', [new LanguageModelTextPart('a\n'), new LanguageModelTextPart('b')]);
+      assert.equal(invoke<Record<string, string>>(provider, 'convertToolResultPart', part).content, 'a\nb');
+    });
+  });
+
+  test('falls back to JSON only for parts with no text form', () => {
+    withProvider({ qwenToolLoopCompat: false }, (provider) => {
       const out = invoke<Record<string, string>>(provider, 'convertToolResultPart', new LanguageModelToolResultPart('c', [{ any: 1 }]));
-      assert.equal(out.content, '[{"any":1}]');
+      assert.equal(out.content, '{"any":1}');
+    });
+  });
+
+  test('duck-typed tool results are flattened the same way', () => {
+    withProvider({ qwenToolLoopCompat: false }, (provider) => {
+      const toolResults: Record<string, unknown>[] = [];
+      invoke(provider, 'processPartDuckTyped', { callId: 'd1', content: [new LanguageModelTextPart('x "y"\n')] }, toolResults, []);
+      assert.deepEqual(toolResults, [{ tool_call_id: 'd1', role: 'tool', content: 'x "y"\n' }]);
     });
   });
 });

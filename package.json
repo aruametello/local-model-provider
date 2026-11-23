@@ -2,7 +2,7 @@
   "name": "local-model-provider-custom",
   "displayName": "(custom) Local Model Provider",
   "description": "VS Code extension to connect to local LLM inference servers (Ollama, llama.cpp, LocalAI, LM Studio, vLLM) via OpenAI API compatible endpoints.",
-  "version": "1.2.23",
+  "version": "1.3.2",
   "publisher": "krevas",
   "icon": "assets/local-model-provider.png",
   "private": true,
@@ -21,13 +21,13 @@
     "esbuild-watch": "npm run esbuild-base -- --sourcemap --watch",
     "test": "tsc -p tsconfig.test.json && node out-test/test/qwenXml.test.js && node out-test/test/charHandling.test.js && node out-test/test/requestLog.test.js && node out-test/test/client.test.js && node out-test/test/tokenBudget.test.js && node out-test/test/messages.test.js && node out-test/test/jsonRepair.test.js && node out-test/test/modelList.test.js && node out-test/test/statistics.test.js && node out-test/test/crashLog.test.js && node out-test/test/outputFidelity.test.js",
     "test-qwen": "tsc -p tsconfig.test.json && node out-test/test/qwenXml.test.js",
-        "test-char": "tsc -p tsconfig.test.json && node out-test/test/charHandling.test.js && node out-test/test/requestLog.test.js",
-        "test-compile": "tsc -p ./",
-        "prebuild": "npm test",
-        "prepackage": "npm test",
-        "deploy": "vsce publish --no-yarn",
-        "package": "vsce package --no-yarn"
-      },
+    "test-char": "tsc -p tsconfig.test.json && node out-test/test/charHandling.test.js && node out-test/test/requestLog.test.js",
+    "test-compile": "tsc -p ./",
+    "prebuild": "npm test",
+    "prepackage": "npm test",
+    "deploy": "vsce publish --no-yarn",
+    "package": "vsce package --no-yarn"
+  },
   "categories": [
     "AI",
     "Machine Learning",
@@ -124,7 +124,10 @@
                 "description": "Server URL"
               }
             },
-            "required": ["name", "url"]
+            "required": [
+              "name",
+              "url"
+            ]
           },
           "description": "Saved server presets for quick switching",
           "order": 3

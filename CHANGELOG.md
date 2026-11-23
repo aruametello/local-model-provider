@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.3.2
+
+### Bug Fixes
+- **Tool results reach the model as plain text again.** VS Code passes a tool result's `content` as an array of `LanguageModelTextPart`; it was sent with `JSON.stringify`, which emits VS Code's marshalled form (`[{"$mid":21,"value":"..."}]`). The model therefore read newlines as `\n`, quotes as `\"` and every backslash doubled (`c:\\devkit`), and copied those escapes into the files it edited. Text parts are now joined verbatim (`toolResultContentToText`, used by both the typed and the duck-typed tool-result paths); only parts with no text form fall back to JSON.
+
+### Tests
+- `test/messages.test.ts`: the case that pinned the JSON serialisation of tool results was replaced by four cases — a Windows path, CRLF, quotes, `órgão` and `✓` survive unchanged with no `$mid` envelope; several text parts are joined in order; a part with no text form falls back to JSON; the duck-typed path behaves the same. The `vscode` stub's `LanguageModelTextPart` now has VS Code's `toJSON` (`{$mid: 21, value}`), so a regression to `JSON.stringify` shows up in tests exactly as it would on the wire.
+
+### Packaging
+- `install_build/install.bat` restored to CRLF line endings (the working copy had LF).
+
 ## 1.2.23
 
 ### Bug Fixes

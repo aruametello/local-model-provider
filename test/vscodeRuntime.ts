@@ -345,6 +345,11 @@ export const vscode: any = {
   // duck-typed fallback branches in provider.ts.
   LanguageModelTextPart: class {
     constructor(public value: string, public name?: string, public censored?: boolean) {}
+    // Mirrors VS Code's marshalled form, so JSON.stringify on a real part array
+    // shows up in tests exactly as it would reach the server.
+    toJSON() {
+      return { $mid: 21, value: this.value };
+    }
   },
   LanguageModelThinkingPart: class {
     constructor(public value: string, public title?: string) {}

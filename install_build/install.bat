@@ -3,7 +3,7 @@ setlocal EnableExtensions
 title (custom) Local Model Provider - Installer
 
 set "SCRIPT_DIR=%~dp0"
-set "VSIX=%SCRIPT_DIR%local-model-provider-custom-1.2.23.vsix"
+set "VSIX=%SCRIPT_DIR%local-model-provider-custom-1.3.2.vsix"
 
 echo ============================================================
 echo  (custom) Local Model Provider - portable installer
