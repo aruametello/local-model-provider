@@ -1,4 +1,5 @@
 import { writeRequestLog } from './requestLog';
+import { appendConnectionLog, startConnectionTrace } from './connectionLog';
 import * as vscode from 'vscode';
 import { randomBytes } from 'node:crypto';
 import {
@@ -696,6 +697,28 @@ export class GatewayClient {
   }
 
   /**
+   * Append one line to the connection log (`connections-<day>.log` in the
+   * request-log folder, when configured). Fire-and-forget like logRequest;
+   * a failure is reported once per folder, not once per line.
+   */
+  private connectionLogFailedDir?: string;
+  private writeConnectionLog(line: string): void {
+    const dir = this.config.requestLogDirectory;
+    if (!dir) {
+      return;
+    }
+    appendConnectionLog(dir, line).then(
+      () => { this.connectionLogFailedDir = undefined; },
+      (err) => {
+        if (this.connectionLogFailedDir !== dir) {
+          this.connectionLogFailedDir = dir;
+          this.logSink?.('warn', `Could not write connection log to "${dir}": ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    );
+  }
+
+  /**
    * Stream chat completions from /v1/chat/completions endpoint
    *
    * IMPORTANT: Tool calls are tracked by INDEX during streaming, not by ID.
@@ -708,6 +731,19 @@ export class GatewayClient {
   ): AsyncGenerator<{ content: string; reasoning_content?: string; tool_calls: StreamingToolCall[]; finished_tool_calls: StreamingToolCall[]; finish_reason?: string; usage?: OpenAIUsage }, void, unknown> {
     const url = `${this.config.serverUrl}/v1/chat/completions`;
     const state = this.createToolCallState();
+    // Kept outside the try so the finally below can release the response body
+    // when the stream stops before EOF (see the finally for why).
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    let streamFinished = false;
+    // Connection trace: start/headers/first-data/end lines with the number of
+    // requests open at each moment. An overlap (this request starting while
+    // another is still open) is always reported in the output channel too.
+    let endReason: string | undefined;
+    let failure: unknown;
+    const trace = startConnectionTrace(url, (line) => this.writeConnectionLog(line));
+    if (trace.overlappedWith.length > 0) {
+      this.logSink?.('warn', `Chat request #${trace.id} started while ${trace.overlappedWith.map((n) => `#${n}`).join(', ')} still open (parallel requests to the server).`);
+    }
 
     try {
       // Request per-response token usage (OpenAI/llama.cpp/vLLM support this via
@@ -728,9 +764,11 @@ export class GatewayClient {
         headers: { ...this.getHeaders(), 'Content-Type': 'application/json' },
         body: bodyJson,
       }, 'Chat completion', cancellationToken);
+      trace.headers(response.status);
 
       if (!response.ok) {
         const errorText = await response.text().catch(() => '');
+        endReason = `http-${response.status}`;
         throw new GatewayError(
           `Chat completion failed: ${response.status} ${response.statusText}${errorText ? ` - ${errorText}` : ''}`,
           response.status,
@@ -748,13 +786,14 @@ export class GatewayClient {
       // silently replacing the offending bytes with U+FFFD — silent replacement would
       // feed mangled text to the user with no error, no warning, and no retry. The
       // decode error is caught below and surfaced as a retryable GatewayError.
-      const reader = response.body.getReader();
+      reader = response.body.getReader();
       const decoder = new TextDecoder('utf-8', { fatal: true });
       let buffer = '';
       let receivedAnyData = false;
 
       while (true) {
         if (cancellationToken.isCancellationRequested) {
+          endReason = 'cancelled';
           await reader.cancel();
           break;
         }
@@ -776,13 +815,19 @@ export class GatewayClient {
           // Some servers (e.g. LM Studio) close the connection without sending [DONE]
           if (receivedAnyData && !(readError instanceof GatewayError)) {
             console.warn('[LLM Gateway] Stream read interrupted after receiving data, treating as end-of-stream:', readError);
+            endReason = 'server-dropped-after-data';
             break;
           }
           throw readError;
         }
 
         const { done, value } = readResult;
-        if (done) { break; }
+        if (done) {
+          streamFinished = true;
+          endReason = 'eof';
+          break;
+        }
+        trace.data(value.byteLength);
 
         try {
           buffer += decoder.decode(value, { stream: true });
@@ -835,6 +880,7 @@ export class GatewayClient {
         yield { content: '', tool_calls: [], finished_tool_calls: remaining };
       }
     } catch (error) {
+      failure = error;
       // A user cancellation aborts the fetch/reader; surface it as a clean
       // cancellation instead of a misleading "connection terminated" error.
       if (cancellationToken.isCancellationRequested) {
@@ -870,6 +916,24 @@ export class GatewayClient {
         );
       }
       throw error;
+    } finally {
+      // Release the response body whenever the stream did not reach EOF: the
+      // consumer broke out of its for-await (e.g. on cancellation, which calls
+      // the generator's return() while it is suspended at a yield, so the
+      // in-loop cancellation check and readWithIdleTimeout's listener never
+      // run), or an error escaped mid-stream. Without this the body stays
+      // unread: the server keeps generating up to max_tokens for nobody, and
+      // the connection never goes back to the keep-alive pool. Not awaited, so
+      // a stuck cancel cannot block the caller; cancelling twice is harmless.
+      if (reader && !streamFinished) {
+        reader.cancel().catch(() => { /* body already closed or errored */ });
+      }
+      trace.end(
+        endReason
+          ?? (cancellationToken.isCancellationRequested ? 'cancelled'
+            : failure !== undefined ? `error: ${(failure instanceof Error ? failure.message : String(failure)).replace(/\s+/g, ' ').slice(0, 200)}`
+              : 'consumer-stopped')
+      );
     }
   }
 

@@ -2,7 +2,7 @@
   "name": "local-model-provider-custom",
   "displayName": "(custom) Local Model Provider",
   "description": "VS Code extension to connect to local LLM inference servers (Ollama, llama.cpp, LocalAI, LM Studio, vLLM) via OpenAI API compatible endpoints.",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "publisher": "krevas",
   "icon": "assets/local-model-provider.png",
   "private": true,
@@ -19,7 +19,7 @@
     "esbuild-base": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --target=es2020",
     "esbuild": "npm run esbuild-base -- --sourcemap",
     "esbuild-watch": "npm run esbuild-base -- --sourcemap --watch",
-    "test": "tsc -p tsconfig.test.json && node out-test/test/qwenXml.test.js && node out-test/test/charHandling.test.js && node out-test/test/requestLog.test.js && node out-test/test/client.test.js && node out-test/test/tokenBudget.test.js && node out-test/test/messages.test.js && node out-test/test/jsonRepair.test.js && node out-test/test/modelList.test.js && node out-test/test/statistics.test.js && node out-test/test/crashLog.test.js && node out-test/test/outputFidelity.test.js",
+    "test": "tsc -p tsconfig.test.json && node out-test/test/qwenXml.test.js && node out-test/test/charHandling.test.js && node out-test/test/requestLog.test.js && node out-test/test/connectionLog.test.js && node out-test/test/client.test.js && node out-test/test/tokenBudget.test.js && node out-test/test/messages.test.js && node out-test/test/jsonRepair.test.js && node out-test/test/modelList.test.js && node out-test/test/statistics.test.js && node out-test/test/crashLog.test.js && node out-test/test/outputFidelity.test.js",
     "test-qwen": "tsc -p tsconfig.test.json && node out-test/test/qwenXml.test.js",
     "test-char": "tsc -p tsconfig.test.json && node out-test/test/charHandling.test.js && node out-test/test/requestLog.test.js",
     "test-compile": "tsc -p ./",
@@ -165,7 +165,7 @@
         "local.model.provider.requestLogDirectory": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Absolute path of a folder where the FULL context sent to the upstream server for each chat request is saved (one JSON file per request: messages, tools, options). Meant for debugging past exchanges. Leave empty to disable. Files may contain your prompts, code and attached images, so keep this folder private.\n\n[$(folder-opened) Open log folder](command:local-model-provider-custom.openRequestLogFolder)",
+          "markdownDescription": "Absolute path of a folder where the FULL context sent to the upstream server for each chat request is saved (one JSON file per request: messages, tools, options). Meant for debugging past exchanges. Leave empty to disable. Files may contain your prompts, code and attached images, so keep this folder private. The same folder also gets `connections-<YYYY-MM-DD>.log`: one line per HTTP chat request event (start, headers, first data, end) with the number of requests open at that moment, flagging requests that overlap; the 14 newest daily files are kept.\n\n[$(folder-opened) Open log folder](command:local-model-provider-custom.openRequestLogFolder)",
           "order": 22
         },
         "local.model.provider.requestLogMaxMb": {

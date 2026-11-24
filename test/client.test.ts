@@ -7,6 +7,9 @@
 import './vscodeRuntime'; // must precede ../src imports (installs the vscode stub)
 
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { describe, test, run } from './harness';
 import { invoke } from './vscodeRuntime';
 import { GatewayClient, GatewayError, sanitizeLoneSurrogates } from '../src/client';
@@ -759,6 +762,116 @@ describe('streamChatCompletion', () => {
       assert.ok(out.length <= 1);
     } finally {
       (globalThis as any).fetch = realFetch;
+    }
+  });
+
+  test('releases the response body when the consumer stops early', async () => {
+    // Stream left open after the first chunk: the server is still "generating".
+    // Breaking out of the for-await (what provider.ts does on cancellation)
+    // must cancel the body, or the server keeps generating and the connection
+    // never returns to the keep-alive pool.
+    let bodyCancelled = false;
+    const encoder = new TextEncoder();
+    (globalThis as any).fetch = async () => ({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      body: new ReadableStream<Uint8Array>({
+        start(c) { c.enqueue(encoder.encode(tokenChunk('first '))); },
+        cancel() { bodyCancelled = true; },
+      }),
+    });
+    const token = { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) } as any;
+    try {
+      for await (const chunk of new GatewayClient(baseConfig()).streamChatCompletion({ model: 'm', messages: [] } as any, token)) {
+        assert.equal(chunk.content, 'first ');
+        break;
+      }
+      await new Promise((r) => setImmediate(r));
+      assert.equal(bodyCancelled, true);
+    } finally {
+      (globalThis as any).fetch = realFetch;
+    }
+  });
+
+  test('does not cancel a body that was read to EOF', async () => {
+    let bodyCancelled = false;
+    const encoder = new TextEncoder();
+    (globalThis as any).fetch = async () => ({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      body: new ReadableStream<Uint8Array>({
+        start(c) { c.enqueue(encoder.encode(tokenChunk('all'))); c.close(); },
+        cancel() { bodyCancelled = true; },
+      }),
+    });
+    const token = { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) } as any;
+    try {
+      const out: string[] = [];
+      for await (const chunk of new GatewayClient(baseConfig()).streamChatCompletion({ model: 'm', messages: [] } as any, token)) {
+        out.push(chunk.content);
+      }
+      await new Promise((r) => setImmediate(r));
+      assert.deepEqual(out, ['all']);
+      assert.equal(bodyCancelled, false);
+    } finally {
+      (globalThis as any).fetch = realFetch;
+    }
+  });
+
+  test('connection log: sequential requests are not flagged, overlapping ones are', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'lmp-client-connlog-'));
+    const encoder = new TextEncoder();
+    const controllers: Array<ReadableStreamDefaultController<Uint8Array>> = [];
+    (globalThis as any).fetch = async () => ({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      body: new ReadableStream<Uint8Array>({
+        start(c) { c.enqueue(encoder.encode(tokenChunk('x'))); controllers.push(c); },
+      }),
+    });
+    const token = { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) } as any;
+    const client = new GatewayClient(baseConfig({ requestLogDirectory: dir }));
+    const warnings: string[] = [];
+    client.logSink = (level, message) => { if (level === 'warn') { warnings.push(message); } };
+    const drain = async () => {
+      for await (const _ of client.streamChatCompletion({ model: 'm', messages: [] } as any, token)) { /* consume */ }
+    };
+    try {
+      // Sequential: the first stream ends (EOF) before the second starts.
+      const first = drain();
+      while (controllers.length < 1) { await new Promise((r) => setImmediate(r)); }
+      controllers[0].close();
+      await first;
+      const second = drain();
+      while (controllers.length < 2) { await new Promise((r) => setImmediate(r)); }
+      controllers[1].close();
+      await second;
+      assert.deepEqual(warnings, []);
+
+      // Overlapping: a third starts while a fourth is still open.
+      const third = drain();
+      while (controllers.length < 3) { await new Promise((r) => setImmediate(r)); }
+      const fourth = drain();
+      while (controllers.length < 4) { await new Promise((r) => setImmediate(r)); }
+      controllers[2].close();
+      controllers[3].close();
+      await Promise.all([third, fourth]);
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0], /started while #\d+ still open/);
+
+      await new Promise((r) => setTimeout(r, 50));
+      const files = (await fs.readdir(dir)).filter((n) => n.startsWith('connections-'));
+      assert.equal(files.length, 1);
+      const log = await fs.readFile(path.join(dir, files[0]), 'utf8');
+      assert.equal((log.match(/ start /g) ?? []).length, 4);
+      assert.equal((log.match(/ end +open=\d+ reason=eof /g) ?? []).length, 4);
+      assert.equal((log.match(/ OVERLAP /g) ?? []).length, 1);
+    } finally {
+      (globalThis as any).fetch = realFetch;
+      await fs.rm(dir, { recursive: true, force: true });
     }
   });
 });

@@ -9,6 +9,7 @@
     "src/qwenXml.ts",
     "src/charUtils.ts",
     "src/requestLog.ts",
+    "src/connectionLog.ts",
     "src/client.ts",
     "src/statistics.ts",
     "src/crashLog.ts",

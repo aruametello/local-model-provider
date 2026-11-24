@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.3.3
+
+### Bug Fixes
+- **A stream stopped early now releases its HTTP connection.** When the consumer broke out of `streamChatCompletion` before the end of the response (on cancellation, `provider.ts` breaks its `for await` while the generator is suspended at a `yield`), the response body was never cancelled: the server kept generating up to `max_tokens` for nobody and the connection never went back to the keep-alive pool. A `finally` now cancels the body whenever the stream did not reach EOF.
+
+### Features
+- **Connection log** for diagnosing requests that overlap on the wire. With `requestLogDirectory` set, every chat request writes `start`, `headers`, `first-data` and `end` lines (end reason, duration, last data, chunks, bytes), each with the number of requests open at that moment, to `connections-<YYYY-MM-DD>.log` (the newest 14 daily files are kept). A request that starts while another is still open gets an `OVERLAP` line and is always reported in the output channel.
+
+### Tests
+- `test/client.test.ts` (63 cases): body cancelled when the consumer stops early and not after EOF; connection log and overlap warning for sequential vs overlapping streams.
+- New `test/connectionLog.test.ts`: line format, overlap flag, idempotent end, daily file, pruning.
+
 ## 1.3.2
 
 ### Bug Fixes
